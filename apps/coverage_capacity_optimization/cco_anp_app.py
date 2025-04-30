@@ -24,7 +24,7 @@ from radp.client.helper import ModelStatus, RADPHelper  # noqa: E402
 
 SCRIPT_ROOT = os.path.dirname(os.path.abspath(__file__))
 # get example app absolute path
-data_path = os.path.join(SCRIPT_ROOT, "../anp_sim_data")
+data_path = os.path.join(SCRIPT_ROOT, "./anp")
 
 TOPOLOGY_FILE = os.path.join(data_path, "topology.csv")
 TRAINING_DATA_FILES = [

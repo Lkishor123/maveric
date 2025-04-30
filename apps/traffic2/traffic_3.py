@@ -688,77 +688,112 @@ def run_traffic_simulation_and_analysis(
     dummy_training_data = pd.DataFrame() # Regenerate dummy training data based on this run
     # ... (logic to generate dummy_training_data as before) ...
 
-    # --- *** GENERATE DUMMY TRAINING DATA *** ---
+# Inside run_traffic_simulation_and_analysis function in traffic_3.py
+
+    # --- *** GENERATE DUMMY TRAINING DATA (Limited Size) *** ---
     logger.warning("Generating DUMMY training data - RSRP values DO NOT accurately reflect tilt effects.")
-    dummy_training_data = pd.DataFrame() # Initialize empty
+    logger.warning(f"Limiting dummy training data to approximately 12000 rows.")
+    dummy_training_data_list = []
+    possible_tilts = list(np.arange(0.0, 21.0, 1.0))
+    assumed_optimal_tilt = 8.0
+    tilt_penalty_factor = 0.5
+    TARGET_TRAINING_ROWS = 12000
+
     try:
-        if serving_cell_data.empty or ue_rxpower_data.empty:
-             logger.warning("Cannot generate dummy training data: Missing serving cell or RxPower data.")
+        if trafficload_ue_data.empty:
+             logger.warning("Cannot generate dummy training data: UE data is empty.")
         else:
-            # 1. Get RSRP from the serving cell (based on simple model)
-            # Need ue_id, tick, serving_cell_id, rx_power_dbm
-            serving_cell_power = pd.merge(
-                 serving_cell_data, # columns: tick, ue_id, serving_cell_id
-                 ue_rxpower_data,   # columns: tick, ue_id, CELL_ID, rx_power_dbm
-                 left_on=["tick", "ue_id", "serving_cell_id"],
-                 right_on=["tick", "ue_id", COL_CELL_ID], # Match serving cell ID
-                 how="left"
-            )[["tick", "ue_id", "serving_cell_id", "rx_power_dbm"]] # Select needed cols
+            COL_CELL_EL_DEG = getattr(c, 'CELL_EL_DEG', 'cell_el_deg')
+            COL_LAT=getattr(c,'LAT','lat'); COL_LON=getattr(c,'LON','lon')
+            COL_CELL_LAT=getattr(c,'CELL_LAT','cell_lat'); COL_CELL_LON=getattr(c,'CELL_LON','cell_lon')
+            COL_CELL_ID=getattr(c,'CELL_ID','cell_id'); COL_CELL_TXPWR_DBM=getattr(c,'CELL_TXPWR_DBM','cell_txpwr_dbm')
+            ref_rx_power = -50
+            path_loss_exponent = 3.5
 
-            # 2. Merge with UE locations to get lat/lon
-            ue_locs_with_serving_rsrp = pd.merge(
-                trafficload_ue_data[[COL_LAT, COL_LON, "tick", "ue_id"]], # Use constant names
-                serving_cell_power,
-                on=["tick", "ue_id"],
-                how="inner" # Only keep UEs that had a valid serving cell RSRP
-            )
+            num_cells = len(site_config_data[COL_CELL_ID].unique())
+            if num_cells == 0: raise ValueError("No cells found in site_config_data.")
 
-            # 3. Merge with initial config tilts
-            if COL_CELL_ID not in initial_config_data.columns or COL_CELL_EL_DEG not in initial_config_data.columns:
-                raise ValueError(f"Initial config data must have '{COL_CELL_ID}' and '{COL_CELL_EL_DEG}' columns.")
+            # --- Sampling Step ---
+            num_ue_tick_samples = max(1, int(round(TARGET_TRAINING_ROWS / num_cells)))
+            logger.info(f"Targeting ~{TARGET_TRAINING_ROWS} rows. Will sample {num_ue_tick_samples} UE-tick pairs and process for all {num_cells} cells.")
 
-            training_data_merged = pd.merge(
-                 ue_locs_with_serving_rsrp,
-                 initial_config_data[[COL_CELL_ID, COL_CELL_EL_DEG]],
-                 left_on="serving_cell_id",
-                 right_on=COL_CELL_ID, # Match on cell ID
-                 how="left" # Keep all measurements, add tilt
-            )
-            # Handle cases where a serving cell ID might not be in config (shouldn't happen if validated earlier)
-            if training_data_merged[COL_CELL_EL_DEG].isnull().any():
-                 missing_tilt_cells = training_data_merged[training_data_merged[COL_CELL_EL_DEG].isnull()]['serving_cell_id'].unique()
-                 logger.warning(f"Could not find initial tilt for serving cells: {missing_tilt_cells}. Rows will have NaN tilt.")
-                 # Optionally fill NaN with a default, e.g., training_data_merged[COL_CELL_EL_DEG].fillna(12.0, inplace=True)
+            # Ensure we don't sample more rows than available
+            num_available_ue_ticks = len(trafficload_ue_data)
+            if num_ue_tick_samples > num_available_ue_ticks:
+                logger.warning(f"Requested {num_ue_tick_samples} samples, but only {num_available_ue_ticks} UE-tick pairs available. Using all available.")
+                num_ue_tick_samples = num_available_ue_ticks
 
+            # Sample distinct UE-tick pairs (can adjust replace=True if needed, but sampling unique points is better)
+            # If trafficload_ue_data has unique ue_id per tick, sampling rows is fine.
+            # If ue_id repeats across ticks, maybe sample based on ('tick', 'ue_id') groups?
+            # Let's assume sampling rows is sufficient for now.
+            sampled_ue_data = trafficload_ue_data.sample(n=num_ue_tick_samples, replace=False, random_state=42) # Use random_state for reproducibility
+            logger.info(f"Processing {len(sampled_ue_data)} sampled UE-tick pairs.")
 
-            # 4. Select and rename columns to final format
-            dummy_training_data = training_data_merged.rename(columns={
-                 "serving_cell_id": COL_CELL_ID, # Final column name is 'cell_id'
-                 "rx_power_dbm": "avg_rsrp",
-                 COL_LON: "lon",
-                 COL_LAT: "lat",
-                 COL_CELL_EL_DEG: COL_CELL_EL_DEG # Keep name 'cell_el_deg'
-            })
-            
-            # 5. Select final columns in desired order
-            final_columns = [COL_CELL_ID, "avg_rsrp", "lon", "lat", COL_CELL_EL_DEG]
-            dummy_training_data = dummy_training_data[final_columns]
-            logger.info(f"Generated dummy training data format with {len(dummy_training_data)} rows (includes all ticks).")
+            # --- Iterate through SAMPLED UE points ---
+            for _, ue_row in sampled_ue_data.iterrows():
+                ue_lat = ue_row[COL_LAT]
+                ue_lon = ue_row[COL_LON]
+                # ue_tick = ue_row['tick'] # Not needed for final output format
+                ue_id = ue_row['ue_id'] # For logging
+
+                # --- Iterate through ALL cells for each sampled UE point ---
+                for _, cell_row in site_config_data.iterrows():
+                    cell_id = cell_row[COL_CELL_ID]
+                    cell_lat = cell_row[COL_CELL_LAT]
+                    cell_lon = cell_row[COL_CELL_LON]
+                    cell_txpwr = cell_row[COL_CELL_TXPWR_DBM]
+
+                    # 1. Calculate Simple RSRP
+                    try:
+                        dist_km = GISTools.dist((ue_lat, ue_lon), (cell_lat, cell_lon))
+                        dist_m = dist_km * 1000.0
+                        simple_rsrp = ref_rx_power - 10 * path_loss_exponent * np.log10(dist_m) if dist_m > 1e-3 else cell_txpwr
+                    except Exception as e:
+                        logger.warning(f"RSRP calc error UE {ue_id}, Cell {cell_id}: {e}. Skipping sample.")
+                        continue
+
+                    # 2. Assign Random Tilt
+                    random_tilt = np.random.choice(possible_tilts)
+
+                    # 3. Apply Crude Tilt Adjustment
+                    tilt_deviation = abs(random_tilt - assumed_optimal_tilt)
+                    rsrp_penalty = tilt_deviation * tilt_penalty_factor
+                    adjusted_rsrp = simple_rsrp - rsrp_penalty
+
+                    # 4. Append Data
+                    dummy_training_data_list.append({
+                        COL_CELL_ID: cell_id,
+                        "avg_rsrp": adjusted_rsrp,
+                        "lon": ue_lon,
+                        "lat": ue_lat,
+                        COL_CELL_EL_DEG: random_tilt
+                    })
+
+            # --- Create Final DataFrame ---
+            if dummy_training_data_list:
+                 dummy_training_data = pd.DataFrame(dummy_training_data_list)
+                 final_columns = [COL_CELL_ID, "avg_rsrp", "lon", "lat", COL_CELL_EL_DEG]
+                 dummy_training_data = dummy_training_data[final_columns]
+                 logger.info(f"Generated limited dummy training data with {len(dummy_training_data)} rows.")
+            else:
+                 logger.warning("No dummy training data points were generated.")
+                 dummy_training_data = pd.DataFrame()
 
     except Exception as e:
-        logger.exception(f"Failed to generate dummy training data: {e}") # Log full traceback
-        dummy_training_data = pd.DataFrame() # Ensure it's empty on error
+        logger.exception(f"Failed to generate dummy training data: {e}")
+        dummy_training_data = pd.DataFrame()
 
     logger.info("--- Traffic Simulation and Analysis Finished ---")
     # Return results including the dummy data
     return {
         "trafficload_ue_data": trafficload_ue_data,
-        "ue_rxpower_data": ue_rxpower_data,
-        "serving_cell_data": serving_cell_data,
+        "ue_rxpower_data": ue_rxpower_data, # Note: This still contains simple RSRP, not adjusted
+        "serving_cell_data": serving_cell_data, # Note: Based on simple RSRP
         "trafficload_metric_per_tick": trafficload_metric,
         "energyload_metric_per_tick": energyload_metric,
-        "dummy_training_data": dummy_training_data, # Add the new dataframe
-        "spatial_cells": spatial_cells # Optional: return the layout used
+        "dummy_training_data": dummy_training_data, # Contains adjusted RSRP and random tilt
+        "spatial_cells": spatial_cells
     }
 
 # --- Main Execution Block ---
