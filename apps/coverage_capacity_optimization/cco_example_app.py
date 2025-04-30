@@ -25,9 +25,9 @@ data_path = os.path.join(SCRIPT_ROOT, "data")
 # Set input files
 TOPOLOGY_FILE = os.path.join(data_path, "topology.csv")
 TRAINING_DATA_FILES = [os.path.join(data_path, "ue_training_data.csv")]
-PREDICTION_DATA_FILES = [os.path.join(data_path, "ue_data.csv")]
+PREDICTION_DATA_FILES = [os.path.join(data_path, "generated_ue_data_for_cco.csv")]
 PREDICTION_CONFIG = os.path.join(data_path, "config.csv")
-MODEL_ID = "cco_test_model"
+MODEL_ID = "cco_test2_model"
 TRAINING_PARAMS: Dict = {}
 
 # Load input data
@@ -53,7 +53,7 @@ train_response = radp_client.train(
 
 # resolve the model status -- this blocking call ensures training is done and model is available for use
 model_status: ModelStatus = radp_helper.resolve_model_status(
-    MODEL_ID, wait_interval=3, max_attempts=10, verbose=True
+    MODEL_ID, wait_interval=30, max_attempts=100, verbose=True
 )
 
 # handle an exception if one occurred
@@ -89,6 +89,8 @@ VALID_CONFIGURATION_VALUES = {
         20.0,
     ]
 }
+
+print(f"Run Model")
 
 # instantiate the dGPCO CCO class
 dgpco_cco = DgpcoCCO(

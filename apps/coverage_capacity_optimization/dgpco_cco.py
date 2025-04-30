@@ -82,7 +82,7 @@ class DgpcoCCO:
 
         simulation_status: SimulationStatus = radp_helper.resolve_simulation_status(
             simulation_id,
-            wait_interval=1,
+            wait_interval=10,
             max_attempts=100,
             verbose=False,
         )
