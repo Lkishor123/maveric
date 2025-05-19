@@ -11,9 +11,16 @@ import logging
 import math
 from typing import Dict, List, Tuple, Optional, Any
 
+
 # --- Assume RADP imports & setup ---
 # Ensure RADP_ROOT is set correctly in environment or script
-RADP_ROOT = os.getenv("MAVERIC_ROOT", "/path/to/your/maveric/project") # MODIFY IF NEEDED
+RADP_ROOT = os.getenv("MAVERIC_ROOT", "/home/lk/Projects/accelcq-repos/cloudly/github/maveric") # MODIFY IF NEEDED
+
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
 if not os.path.isdir(RADP_ROOT):
      potential_path = os.path.join(os.path.dirname(__file__), "..", "..")
      if os.path.isdir(os.path.join(potential_path, "radp")): RADP_ROOT = os.path.abspath(potential_path); print(f"Warning: RADP_ROOT assumed: {RADP_ROOT}")
@@ -43,9 +50,6 @@ except ImportError:
     print("FATAL: stable-baselines3 not found. Please install it: pip install stable-baselines3")
     sys.exit(1)
 
-# --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 # === Custom Gym Environment Definition ===
 # (Ideally, this class should be in its own file, e.g., cco_rl_env.py and imported)
@@ -85,8 +89,10 @@ class CCO_RL_Env(gym.Env):
         self.observation_space = spaces.Discrete(24) # Hour 0-23
 
         self.ue_data_per_tick: Dict[int, Optional[pd.DataFrame]] = self._load_all_ue_data()
-        if not any(self.ue_data_per_tick.values()): # Check if any data was actually loaded
-            raise FileNotFoundError(f"No valid UE data files found or loaded from {ue_data_dir}")
+        at_least_one_df_loaded = any(df is not None for df in self.ue_data_per_tick.values())
+
+        if not at_least_one_df_loaded: # If the flag is False (meaning all values were None or dict empty)
+            raise FileNotFoundError(f"No valid UE data files were successfully loaded from {self.ue_data_dir}")
 
         self.current_tick = 0
         self._current_config_id_counter = 0
