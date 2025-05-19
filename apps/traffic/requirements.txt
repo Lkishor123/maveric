@@ -1,0 +1,25 @@
+# requirements.txt
+
+# Core Data Handling
+pandas>=1.3.0  # For DataFrame manipulation
+numpy>=1.20.0   # For numerical operations
+
+# RL Environment and Training/Prediction (Stable Baselines3)
+gymnasium>=0.26.0             # Successor to OpenAI Gym, for RL environment structure
+stable-baselines3[extra]>=2.0.0 # RL algorithms (PPO) + extra dependencies like TensorBoard
+                               # Installs either TensorFlow or PyTorch automatically based on your system,
+                               # but explicitly installing one backend is recommended.
+
+# Choose ONE Deep Learning Backend for Stable Baselines3:
+tensorflow>=2.10.0            # Option 1: Google's TensorFlow backend (often easier setup)
+# torch>=1.13.0                 # Option 2: PyTorch backend (uncomment this line and comment out tensorflow if preferred)
+
+# Spatial/Geometric Libraries (Used in traffic script)
+shapely>=2.0.0                # For polygon manipulation (clipping Voronoi cells)
+scipy>=1.7.0                  # Optional: For Voronoi diagram generation (used in traffic script)
+
+# Plotting (Optional - Used in traffic script)
+matplotlib>=3.4.0             # For generating plots of UE distribution
+
+# Configuration/Environment (Used in some examples)
+python-dotenv>=0.19.0         # For loading .env files if used (e.g., in RADPClient examples)
