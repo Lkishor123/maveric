@@ -202,7 +202,7 @@ class TestTrafficDemandModel(unittest.TestCase):
             "total_ticks": 1,
             "time_weights": {"residential": [0], "commercial": [0], "park": [0]},
         }
-        mock_layout = [{"bounds": [(0, 0), (1, 0), (1, 1), (0, 1)], "type": "residential", "cell_id": 0}]
+        mock_layout = [{"bounds": [(0, 0), (1, 0), (1, 1), (0, 1)], "type": "residential", "spatial_cell_id": 0}]
         ue_data_per_tick = self.traffic_model._distribute_ues_in_layout(
             mock_layout, zero_weight_time_params, self.num_ues_per_tick
         )
@@ -210,7 +210,7 @@ class TestTrafficDemandModel(unittest.TestCase):
 
     def test_distribute_ues_num_ues_zero(self):
         """Test _distribute_ues_in_layout with num_ues_per_tick = 0."""
-        mock_layout = [{"bounds": [(0, 0), (1, 0), (1, 1), (0, 1)], "type": "residential", "cell_id": 0}]
+        mock_layout = [{"bounds": [(0, 0), (1, 0), (1, 1), (0, 1)], "type": "residential", "spatial_cell_id": 0}]
         ue_data_per_tick = self.traffic_model._distribute_ues_in_layout(mock_layout, self.time_params, 0)
         self.assertEqual(len(ue_data_per_tick[0]), 0)
         self.assertEqual(len(ue_data_per_tick[1]), 0)
@@ -237,7 +237,9 @@ class TestTrafficDemandModel(unittest.TestCase):
     @patch.object(TrafficDemandModel, "_distribute_ues_in_layout")
     def test_generate_traffic_demand_orchestration(self, mock_distribute_ues, mock_generate_layout):
         """Test the main generate_traffic_demand method's orchestration."""
-        mock_spatial_layout_output = [{"bounds": [(0, 0), (1, 0), (1, 1), (0, 1)], "type": "residential", "cell_id": 0}]
+        mock_spatial_layout_output = [
+            {"bounds": [(0, 0), (1, 0), (1, 1), (0, 1)], "type": "residential", "spatial_cell_id": 0}
+        ]
         mock_ue_data_output = {0: pd.DataFrame({c.LON: [0.5], c.LAT: [0.5]})}
 
         mock_generate_layout.return_value = mock_spatial_layout_output
