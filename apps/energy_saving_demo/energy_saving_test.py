@@ -13,7 +13,7 @@ import torch
 import gpytorch
 
 # --- Path Setup ---
-RADP_ROOT = os.getenv("MAVERIC_ROOT", "/path/to/your/maveric/project") # MODIFY IF NEEDED
+RADP_ROOT = os.getenv("MAVERIC_ROOT", "/home/lk/Projects/accelcq-repos/cloudly/github/maveric/") # MODIFY IF NEEDED
 if not os.path.isdir(RADP_ROOT):
     potential_path = os.path.join(os.path.dirname(__file__), "..", "..") # Adjust if script is deeper
     if os.path.isdir(os.path.join(potential_path, "radp")):
@@ -37,7 +37,7 @@ try:
     # Assuming CcoEngine is in apps/coverage_capacity_optimization relative to RADP_ROOT
     sys.path.insert(0, os.path.join(RADP_ROOT, "apps"))
     from coverage_capacity_optimization.cco_engine import CcoEngine
-    from energy_savings_gym import EnergySavingsGym # From the file you provided
+    from apps.energy_savings.energy_savings_gym import EnergySavingsGym # From the file you provided
 except ImportError as e:
     print(f"FATAL: Error importing modules: {e}. Check paths and dependencies.")
     sys.exit(1)
