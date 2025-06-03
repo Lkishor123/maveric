@@ -4,174 +4,69 @@ import os
 import sys
 import json
 import logging
+import math
 from typing import Dict, List, Any, Optional, Tuple # Ensure Any, Optional, Tuple are imported
 
 import pandas as pd
 import numpy as np
-import torch # For loading saved model states
-import gpytorch # For GPyTorch models
+# import torch # Not directly needed here if BDT objects are fully pickled/unpickled
+# import gpytorch # Not directly needed here if BDT objects are fully pickled/unpickled
 
-# --- Path Setup (Ensure this points to your Maveric project root) ---
-RADP_ROOT = os.getenv("MAVERIC_ROOT", "/path/to/your/maveric/project") # MODIFY IF NEEDED
+# --- Path Setup ---
+RADP_ROOT = os.getenv("MAVERIC_ROOT", "/home/lk/Projects/accelcq-repos/cloudly/github/maveric/") # MODIFY IF NEEDED
+# ... (rest of path setup as before) ...
 if not os.path.isdir(RADP_ROOT):
-     potential_path = os.path.join(os.path.dirname(__file__), "..", "..")
-     if os.path.isdir(os.path.join(potential_path, "radp")): RADP_ROOT = os.path.abspath(potential_path); print(f"Warning: RADP_ROOT assumed: {RADP_ROOT}")
-     else: raise FileNotFoundError(f"RADP_ROOT directory not found: {RADP_ROOT}.")
+    potential_path = os.path.join(os.path.dirname(__file__), "..", "..")
+    if os.path.isdir(os.path.join(potential_path, "radp")):
+        RADP_ROOT = os.path.abspath(potential_path)
+        print(f"Warning: RADP_ROOT not explicitly set or found. Assuming relative path: {RADP_ROOT}")
+    else:
+        raise FileNotFoundError(f"RADP_ROOT directory not found: {RADP_ROOT}. Please set path.")
 sys.path.insert(0, RADP_ROOT)
-sys.path.insert(0, os.path.join(RADP_ROOT, "apps")) # To find energy_savings_gym if it's there
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(RADP_ROOT, "apps"))
 
-# --- RADP and CCO Imports ---
+# --- RADP and Custom Imports ---
 try:
     from radp.client.client import RADPClient
     from radp.client.helper import RADPHelper, ModelStatus
     from radp.digital_twin.utils import constants as c
     from radp.digital_twin.utils.gis_tools import GISTools
-    from radp.digital_twin.mobility.ue_tracks import UETracksGenerator # For the Gym
-    # Import necessary classes from bayesian_engine
+    from radp.digital_twin.mobility.ue_tracks import UETracksGenerator
+    # Import BayesianDigitalTwin directly
     from radp.digital_twin.rf.bayesian.bayesian_engine import BayesianDigitalTwin, ExactGPModel, NormMethod
     from coverage_capacity_optimization.cco_engine import CcoEngine
-    # Import the Gym environment
-    from energy_savings_gym import EnergySavingsGym # Assuming it's in energy_savings_gym.py
-    logger = logging.getLogger(__name__) # Define logger after importing logging
-    logger.info("Successfully imported RADP, CCO, and EnergySavingsGym modules.")
+    from apps.energy_savings.energy_savings_gym import EnergySavingsGym
 except ImportError as e:
     print(f"FATAL: Error importing modules: {e}. Check paths and dependencies.")
     sys.exit(1)
-except NameError as e: # Handle logger not defined if logging import failed for some reason
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    logger = logging.getLogger(__name__)
-    logger.error(f"Caught NameError, possibly during logger init, then retried. Original error: {e}")
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# --- Configuration ---
-# Paths to data files (assuming they are in a 'data' subdirectory)
-DATA_DIR = "./data" # Relative to where this script is run
-TOPOLOGY_FILE_PATH = os.path.join(DATA_DIR, "topology.csv") # Your 30-cell topology
-# **IMPORTANT**: Use REALISTIC training data for this BDT model
-TRAINING_DATA_CSV_PATH = os.path.join(DATA_DIR, "realistic_ue_training_data_30cell.csv")
-CONFIG_FILE_PATH = os.path.join(DATA_DIR, "config.csv") # Initial config for tilts
+# --- Configuration (mostly as before) ---
+DATA_DIR = "./"
+TOPOLOGY_FILE_PATH = os.path.join(DATA_DIR, "topology.csv")
+TRAINING_DATA_CSV_PATH = os.path.join(DATA_DIR, "dummy_ue_training_data.csv") # Or your realistic data
+CONFIG_FILE_PATH = os.path.join(DATA_DIR, "config.csv")
+BDT_MODEL_ID = "bdt_for_es_demo_v4" # Use a fresh ID for clarity
+BACKEND_SAVES_MODEL_TO = f"/srv/radp/models/{BDT_MODEL_ID}/model.pickle" # Path inside Docker
+LOCAL_MODEL_ACCESS_PATH = os.path.join(DATA_DIR, "model.pickle") # Where this script looks for the model
 
-# Model ID for the BDT trained on the backend
-BDT_MODEL_ID = "bdt_for_energy_savings_v1"
-# Path where the backend saves the trained BDT model (state and metadata)
-# This path is RELATIVE TO THE BACKEND SERVICE's filesystem (`/srv/radp/models/...`)
-BACKEND_MODEL_SAVE_PATH = f"/srv/radp/models/{BDT_MODEL_ID}/model.pk" # .pk or .pth
-
-# Parameters for EnergySavingsGym
 TILT_SET = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0]
-WEAK_COVERAGE_THRESHOLD = -95.0  # dBm
-OVER_COVERAGE_THRESHOLD = -65.0 # dBm (RSRP for overshooting, SINR usually for interference)
-LAMBDA_WEIGHT = 0.5 # Weight for energy vs CCO metric in reward
+WEAK_COVERAGE_THRESHOLD_GYM = -95.0
+OVER_COVERAGE_THRESHOLD_GYM = -65.0
+LAMBDA_WEIGHT_GYM = 0.5
+NUM_DUMMY_UE_POINTS_PER_CELL_FOR_GYM = 100
+USE_UE_TRACK_GENERATOR_GYM = False # Or False
+GYM_HORIZON = 24
+NUM_UES_FOR_GYM_STEP = 50
 
-# Parameters for dummy UE data for the Gym's prediction_frame_template (if not using UETracksGenerator)
-NUM_DUMMY_UE_POINTS_PER_CELL_FOR_GYM = 100 # Fewer points for faster demo
-
-# Parameters for UETracksGenerator (if used by Gym)
-USE_UE_TRACK_GENERATOR = True # Set to False to use static prediction_frame_template
-GYM_HORIZON = 24 # Number of steps in one Gym episode (e.g., 24 hours)
-
-
-# --- BDT Model Feature Configuration (Must match what the backend model was trained with) ---
-# These are the columns the BayesianDigitalTwin's GPyTorch model was trained on (after preprocessing)
-# Example from bayesian_engine.py's create_prediction_frames
-BDT_X_COLUMNS = [
-    getattr(c, 'CELL_LAT', 'cell_lat'),
-    getattr(c, 'CELL_LON', 'cell_lon'),
-    getattr(c, 'CELL_EL_DEG', 'cell_el_deg'),
-    getattr(c, 'LOG_DISTANCE', 'log_distance'),
-    getattr(c, 'RELATIVE_BEARING', 'relative_bearing'),
-    getattr(c, 'ANTENNA_GAIN', 'antenna_gain'), # Assuming this feature is used
-]
-# The target variable the BDT predicts
-BDT_Y_COLUMNS = [getattr(c, 'RXPOWER_DBM', 'rxpower_dbm')]
-
-
-class GymBDTWrapper:
-    """
-    A wrapper to provide the predict_distributed_gpmodel interface
-    for a single cell using loaded GPyTorch state and metadata.
-    """
-    def __init__(self, gp_model_state: Dict, likelihood_state: Dict, metadata: Dict):
-        self.gp_model_state = gp_model_state
-        self.likelihood_state = likelihood_state
-        self.metadata = metadata
-        self.epsilon = torch.finfo(torch.float32).eps
-
-        # Reconstruct model and likelihood (once per wrapper instance)
-        self.likelihood = gpytorch.likelihoods.GaussianLikelihood(batch_shape=torch.Size([1]))
-        # Use dummy tensors of correct feature size for initialization
-        num_features = self.metadata['num_features']
-        dummy_train_x = torch.zeros(1, 1, num_features)
-        dummy_train_y = torch.zeros(1, 1)
-        self.model = ExactGPModel(dummy_train_x, dummy_train_y, self.likelihood)
-
-        self.model.load_state_dict(self.gp_model_state)
-        self.likelihood.load_state_dict(self.likelihood_state) # Or model handles this
-
-        self.is_cuda = self.metadata.get('is_cuda', False) and torch.cuda.is_available()
-        self.device = torch.device("cuda" if self.is_cuda else "cpu")
-        self.model = self.model.to(self.device)
-        # self.likelihood = self.likelihood.to(self.device) # Often moved with model
-
-        self.model.eval()
-        self.likelihood.eval()
-
-    def predict_distributed_gpmodel(self, prediction_dfs: List[pd.DataFrame]) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Performs prediction for a single cell's data.
-        prediction_dfs is expected to be a list containing ONE DataFrame for this cell.
-        """
-        if not prediction_dfs or prediction_dfs[0].empty:
-            logger.warning(f"Cell {self.metadata.get('cell_id','N/A')}: Empty prediction_df in predict_distributed_gpmodel.")
-            return np.array([]), np.array([])
-
-        ue_prediction_data = prediction_dfs[0] # Get the single DataFrame
-
-        # Normalize input features
-        x_cols = self.metadata['x_columns']
-        norm_method = NormMethod[self.metadata.get('norm_method', 'MINMAX')]
-        # Convert metadata stats to pd.Series for easier broadcasting
-        xmin = pd.Series(self.metadata['xmin']); xmax = pd.Series(self.metadata['xmax'])
-        xmeans = pd.Series(self.metadata['xmeans']); xstds = pd.Series(self.metadata['xstds'])
-
-        if norm_method == NormMethod.MINMAX:
-            range_x = xmax - xmin
-            predict_x_normalized = (ue_prediction_data[x_cols] - xmin) / (range_x + self.epsilon)
-        elif norm_method == NormMethod.ZSCORE:
-            predict_x_normalized = (ue_prediction_data[x_cols] - xmeans) / (xstds + self.epsilon)
-        else:
-            raise ValueError(f"Unknown norm method: {norm_method}")
-
-        predict_X_tensor = torch.tensor(predict_x_normalized.values, dtype=torch.float32).unsqueeze(0).to(self.device)
-
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            observed_pred = self.likelihood(self.model(predict_X_tensor))
-            mean_normalized = observed_pred.mean.squeeze(0).cpu().numpy()
-            variance_normalized = observed_pred.variance.squeeze(0).cpu().numpy()
-
-        # Denormalize
-        ymeans = pd.Series(self.metadata['ymeans']); ystds = pd.Series(self.metadata['ystds'])
-        # Assuming single y_column for simplicity
-        y_mean_val = ymeans.iloc[0]; y_std_val = ystds.iloc[0]
-
-        pred_means_denorm = mean_normalized * (y_std_val + self.epsilon) + y_mean_val
-        pred_stds_denorm = np.sqrt(variance_normalized) * (y_std_val + self.epsilon)
-
-        # The Gym's _next_observation updates the original prediction_dfs[cell_id]
-        # So, we need to make sure this matches what it expects:
-        # It does "self.prediction_dfs[cell_id][constants.RXPOWER_DBM] = pred_means"
-        # The original BDT.predict_distributed_gpmodel also mutated the input dfs list.
-        # This wrapper is for one cell, so we update the input df.
-        COL_RXPOWER_DBM = getattr(c, 'RXPOWER_DBM', 'rxpower_dbm')
-        COL_RXPOWER_STDDEV_DBM = getattr(c, 'RXPOWER_STDDEV_DBM', 'rxpower_stddev_dbm')
-        ue_prediction_data.loc[:, COL_RXPOWER_DBM] = pred_means_denorm
-        ue_prediction_data.loc[:, COL_RXPOWER_STDDEV_DBM] = pred_stds_denorm
-
-        return pred_means_denorm, pred_stds_denorm # Return what Gym might expect, though it uses df
-
+# --- REMOVE GymBDTCellPredictor class definition ---
+# class GymBDTCellPredictor: ...
 
 def main():
-    logger.info("--- Energy Saving Demo App ---")
+    logger.info("--- Energy Saving Demo Application ---")
 
     # --- 1. Initialize RADP Client ---
     try:
@@ -182,191 +77,206 @@ def main():
         logger.error(f"Failed to initialize RADP Client/Helper: {e}")
         return
 
-    # --- 2. Train BDT Model (or ensure it's pre-trained) ---
-    # For this demo, we assume the BDT is already trained or we trigger training here.
-    # If re-training, ensure REALISTIC ue_training_data.csv is used.
+    # --- 2. Train BDT Model via Backend (Currently Commented Out by User in provided script) ---
+    # If you uncomment this, ensure topology_df is loaded here for use below.
+    # For this fix, we assume topology_df will be loaded before Gym input preparation.
+    # try:
+    #     logger.info(f"Loading topology for BDT training from: {TOPOLOGY_FILE_PATH}")
+    #     topology_df_for_training = pd.read_csv(TOPOLOGY_FILE_PATH)
+    #     logger.info(f"Loading UE training data from: {TRAINING_DATA_CSV_PATH}")
+    #     ue_training_df_for_bdt = pd.read_csv(TRAINING_DATA_CSV_PATH)
+
+    #     logger.info(f"Requesting training for BDT model ID: {BDT_MODEL_ID}")
+    #     # ... (rest of training call) ...
+    #     if not status.success:
+    #         logger.error(f"BDT Model training failed for '{BDT_MODEL_ID}': {status.error_message}"); return
+    #     logger.info(f"BDT Model '{BDT_MODEL_ID}' training assumed complete by backend.")
+    # except FileNotFoundError as e: logger.error(f"Data file not found for training: {e}."); return
+    # except Exception as e: logger.exception(f"Error during BDT training phase: {e}"); return
+
+    # --- Load topology (needed for Gym setup, even if BDT training is skipped) ---
     try:
-        logger.info(f"Loading topology from: {TOPOLOGY_FILE_PATH}")
-        topology_df = pd.read_csv(TOPOLOGY_FILE_PATH)
-        logger.info(f"Loading training data from: {TRAINING_DATA_CSV_PATH}")
-        ue_training_df = pd.read_csv(TRAINING_DATA_CSV_PATH) # Use realistic data
-
-        logger.info(f"Requesting training for BDT model: {BDT_MODEL_ID}")
-        train_response = radp_client.train(
-            model_id=BDT_MODEL_ID,
-            params={}, # Add specific training params if needed
-            ue_training_data=ue_training_df,
-            topology=topology_df
-        )
-        logger.info(f"Train request sent. Response: {train_response}")
-        status = radp_helper.resolve_model_status(BDT_MODEL_ID, wait_interval=10, max_attempts=180, verbose=True) # Wait up to 30 mins
-
-        if not status.success:
-            logger.error(f"BDT Model training failed for {BDT_MODEL_ID}: {status.error_message}")
-            return
-        logger.info(f"BDT Model '{BDT_MODEL_ID}' training complete and available.")
-
-    except FileNotFoundError as e:
-        logger.error(f"Required data file not found: {e}. Cannot proceed.")
-        return
+        if 'topology_df' not in locals(): # Ensure topology_df is loaded if training was skipped
+            topology_df = pd.read_csv(TOPOLOGY_FILE_PATH)
+            logger.info(f"Loaded topology from {TOPOLOGY_FILE_PATH} for Gym setup.")
+    except FileNotFoundError:
+        logger.error(f"Topology file not found: {TOPOLOGY_FILE_PATH}. Cannot proceed."); return
     except Exception as e:
-        logger.error(f"Error during BDT training phase: {e}")
-        return
+        logger.error(f"Error loading topology: {e}"); return
+
 
     # --- 3. Load the Trained BDT Model (States and Metadata) ---
-    logger.info(f"Loading trained BDT model states from backend path: {BACKEND_MODEL_SAVE_PATH}")
+    logger.info(f"Attempting to load trained BDT model map from local path: {LOCAL_MODEL_ACCESS_PATH}")
+    # Ensure the directory for LOCAL_MODEL_ACCESS_PATH exists if it's nested
+    model_dir = os.path.dirname(LOCAL_MODEL_ACCESS_PATH)
+    if model_dir and not os.path.exists(model_dir): # Check if model_dir is not empty string
+        os.makedirs(model_dir, exist_ok=True)
+
+    if not os.path.exists(LOCAL_MODEL_ACCESS_PATH):
+        logger.error(f"Model file not found locally: {LOCAL_MODEL_ACCESS_PATH}.")
+        logger.error("Please ensure the model trained by the backend (and saved using the correct method)")
+        logger.error(f"is copied/mounted to this location. Backend saves to: {BACKEND_SAVES_MODEL_TO}")
+        return
     try:
-        # This path is where the *backend training service* saved the model.
-        # Your local script needs a way to access this, or you manually copy it.
-        # For now, let's assume it's accessible at a local equivalent path if using shared volumes,
-        # OR the BayesianDigitalTwin.load_models_from_state can fetch it via client.
-        # For this demo, we assume load_models_from_state handles it or file is locally available.
-        # If load_models_from_state needs a local path, ensure it's correct.
-        # Example: LOCAL_MODEL_SAVE_PATH = os.path.join(DATA_DIR, f"{BDT_MODEL_ID}_model_state.pth")
-        # Ensure model was saved with BayesianDigitalTwin.save_model_state_and_metadata
-        # And that it is locally accessible if load_models_from_state expects a local path.
-        # **This is a key potential point of failure if paths/access aren't right.**
-        # Let's assume it's downloaded/accessible at `LOCAL_MODEL_SAVE_PATH`
-        LOCAL_MODEL_SAVE_PATH = os.path.join(DATA_DIR, BDT_MODEL_ID, "model.pk") # Path convention from backend
-        if not os.path.exists(LOCAL_MODEL_SAVE_PATH):
-            logger.error(f"Model file not found at {LOCAL_MODEL_SAVE_PATH}. Please ensure it's downloaded from backend or path is correct.")
-            logger.error("The backend saves to BACKEND_MODEL_SAVE_PATH. This demo expects it to be accessible locally.")
-            return
+        # Assuming bayesian_engine.py uses load_model_map_from_pickle for old style pickling
+        # If it was changed to load_models_from_state (for torch.save files), use that.
+        # Based on the error, it seems it loaded something, but the type was wrong for subscripting.
+        # Let's assume the user wants to use the original pickling method from bayesian_engine.py for now.
+        loaded_bdt_object_map = BayesianDigitalTwin.load_model_map_from_pickle(LOCAL_MODEL_ACCESS_PATH)
 
-        loaded_bdt_states_map = BayesianDigitalTwin.load_models_from_state(LOCAL_MODEL_SAVE_PATH)
-        if not loaded_bdt_states_map:
-            logger.error("Failed to load BDT model states.")
-            return
-        logger.info(f"Successfully loaded BDT model states for {len(loaded_bdt_states_map)} cells.")
+        if not loaded_bdt_object_map:
+            logger.error("Failed to load BDT model map (returned empty or None)."); return
+        logger.info(f"Successfully loaded BDT model map for {len(loaded_bdt_object_map)} cells.")
 
-        # Prepare the dictionary of GymBDTWrapper instances for the Gym
-        gym_bdt_dict = {}
-        for cell_id_str, cell_data in loaded_bdt_states_map.items():
-            gym_bdt_dict[cell_id_str] = GymBDTWrapper(
-                gp_model_state=cell_data['gp_model_state'],
-                likelihood_state=cell_data['likelihood_state'],
-                metadata=cell_data['metadata']
-            )
+        # The gym_bdt_predictors will now directly be the loaded_bdt_object_map
+        # as EnergySavingsGym expects a Dict[int, BayesianDigitalTwin] or similar interface
+        gym_bdt_predictors = loaded_bdt_object_map
 
     except Exception as e:
-        logger.exception(f"Error loading/preparing BDT model for Gym: {e}")
-        return
-
+        logger.exception(f"Error loading/preparing BDT model map for Gym: {e}"); return
     # --- 4. Prepare Inputs for EnergySavingsGym ---
     logger.info("Preparing inputs for EnergySavingsGym...")
-    site_config_df = topology_df.copy() # Gym expects this name
-    
-    # Create prediction_frame_template OR UETracksGenerator
+    try:
+        site_config_df_gym = pd.read_csv(CONFIG_FILE_PATH)
+        COL_CELL_ID = getattr(c,'CELL_ID','cell_id')
+        COL_CELL_EL_DEG = getattr(c,'CELL_EL_DEG','cell_el_deg')
+
+        if not all(col in site_config_df_gym.columns for col in [COL_CELL_ID, COL_CELL_EL_DEG]):
+            raise ValueError("Config.csv for Gym missing cell_id or cell_el_deg")
+        
+        # Merge with main topology to get all necessary columns for Gym's site_config_df
+        # Ensure topology_df has all columns that create_prediction_frames might need from it.
+        site_config_df_gym = pd.merge(
+            topology_df.copy(), 
+            site_config_df_gym[[COL_CELL_ID, COL_CELL_EL_DEG]],
+            on=COL_CELL_ID,
+            how='left'
+        )
+        site_config_df_gym[COL_CELL_EL_DEG].fillna(TILT_SET[len(TILT_SET)//2], inplace=True)
+
+        # --- *** ADD THIS SECTION TO ENSURE REQUIRED COLUMNS EXIST *** ---
+        COL_HTX = getattr(c, 'HTX', 'hTx')
+        COL_HRX = getattr(c, 'HRX', 'hRx')
+        COL_CELL_AZ_DEG = getattr(c, 'CELL_AZ_DEG', 'cell_az_deg')
+        COL_CELL_CARRIER_FREQ_MHZ = getattr(c, 'CELL_CARRIER_FREQ_MHZ', 'cell_carrier_freq_mhz')
+        
+        DEFAULT_HTX = 25.0  # Example default transmitter height (meters)
+        DEFAULT_HRX = 1.5   # Example default receiver height (meters)
+        DEFAULT_AZIMUTH = 0.0
+        DEFAULT_FREQUENCY = 2100
+
+        if COL_HTX not in site_config_df_gym.columns:
+            logger.warning(f"Column '{COL_HTX}' not found in site_config_df_gym. Adding default value: {DEFAULT_HTX}")
+            site_config_df_gym[COL_HTX] = DEFAULT_HTX
+        if COL_HRX not in site_config_df_gym.columns:
+            logger.warning(f"Column '{COL_HRX}' not found in site_config_df_gym. Adding default value: {DEFAULT_HRX}")
+            site_config_df_gym[COL_HRX] = DEFAULT_HRX
+        
+        # Add other columns expected by create_prediction_frames if they might be missing from your topology.csv
+        if COL_CELL_AZ_DEG not in site_config_df_gym.columns:
+            logger.warning(f"Column '{COL_CELL_AZ_DEG}' not found. Adding default: {DEFAULT_AZIMUTH}")
+            site_config_df_gym[COL_CELL_AZ_DEG] = DEFAULT_AZIMUTH
+        if COL_CELL_CARRIER_FREQ_MHZ not in site_config_df_gym.columns:
+            logger.warning(f"Column '{COL_CELL_CARRIER_FREQ_MHZ}' not found. Adding default: {DEFAULT_FREQUENCY}")
+            site_config_df_gym[COL_CELL_CARRIER_FREQ_MHZ] = DEFAULT_FREQUENCY
+        # --- *** END SECTION TO ADD *** ---
+
+    except FileNotFoundError:
+        logger.error(f"Config file not found: {CONFIG_FILE_PATH}. Using topology and default tilts/heights for Gym.")
+        site_config_df_gym = topology_df.copy()
+        site_config_df_gym[getattr(c,'CELL_EL_DEG','cell_el_deg')] = TILT_SET[len(TILT_SET)//2]
+        site_config_df_gym[getattr(c, 'HTX', 'hTx')] = DEFAULT_HTX # Add defaults here too
+        site_config_df_gym[getattr(c, 'HRX', 'hRx')] = DEFAULT_HRX
+        site_config_df_gym[getattr(c, 'CELL_AZ_DEG', 'cell_az_deg')] = DEFAULT_AZIMUTH
+        site_config_df_gym[getattr(c, 'CELL_CARRIER_FREQ_MHZ', 'cell_carrier_freq_mhz')] = DEFAULT_FREQUENCY
+    except Exception as e:
+        logger.exception(f"Error preparing site_config_df_gym for Gym: {e}. Using basic topology with defaults.");
+        site_config_df_gym = topology_df.copy()
+        site_config_df_gym[getattr(c,'CELL_EL_DEG','cell_el_deg')] = TILT_SET[len(TILT_SET)//2]
+        site_config_df_gym[getattr(c, 'HTX', 'hTx')] = DEFAULT_HTX
+        site_config_df_gym[getattr(c, 'HRX', 'hRx')] = DEFAULT_HRX
+        site_config_df_gym[getattr(c, 'CELL_AZ_DEG', 'cell_az_deg')] = DEFAULT_AZIMUTH
+        site_config_df_gym[getattr(c, 'CELL_CARRIER_FREQ_MHZ', 'cell_carrier_freq_mhz')] = DEFAULT_FREQUENCY
+
     prediction_frame_template_gym = {}
     ue_track_generator_gym = None
+    
+    # *** FIX FOR UnboundLocalError STARTS HERE ***
+    # Read global config into a local variable for this function's scope
+    use_generator_for_this_run = USE_UE_TRACK_GENERATOR_GYM
 
-    if USE_UE_TRACK_GENERATOR:
+    if use_generator_for_this_run: # Check the local variable
         logger.info("Using UETracksGenerator for dynamic UE locations in Gym.")
         try:
-            # Derive bounds from topology
-            min_lat_env = site_config_df[c.CELL_LAT].min() - 0.01 # Small buffer
-            max_lat_env = site_config_df[c.CELL_LAT].max() + 0.01
-            min_lon_env = site_config_df[c.CELL_LON].min() - 0.01
-            max_lon_env = site_config_df[c.CELL_LON].max() + 0.01
-            # These are example parameters for UETracksGenerator
+            min_lat_env = topology_df[c.CELL_LAT].min() - 0.02; max_lat_env = topology_df[c.CELL_LAT].max() + 0.02
+            min_lon_env = topology_df[c.CELL_LON].min() - 0.02; max_lon_env = topology_df[c.CELL_LON].max() + 0.02
             ue_track_generator_gym = UETracksGenerator(
-                n_ues=100, # Number of UEs for Gym steps (can be different from traffic script)
-                min_lat=min_lat_env, max_lat=max_lat_env,
+                n_ues=NUM_UES_FOR_GYM_STEP, min_lat=min_lat_env, max_lat=max_lat_env,
                 min_lon=min_lon_env, max_lon=max_lon_env,
-                x_dim=50, y_dim=50, # Grid dimensions for UE generation
-                min_wait_time=1, max_wait_time=5, # Ticks
-                min_speed=1, max_speed=5, # Grid cells per tick
-                seed=42
+                x_dim=50, y_dim=50, min_wait_time=1, max_wait_time=3,
+                min_speed=1, max_speed=3, seed=np.random.randint(0,10000)
             )
         except Exception as e:
-            logger.error(f"Failed to initialize UETracksGenerator: {e}. Will try static template.")
-            USE_UE_TRACK_GENERATOR = False # Fallback
-
-    if not USE_UE_TRACK_GENERATOR:
-        logger.info("Using static prediction_frame_template for Gym.")
-        # Create a simple grid of UE points for each cell's prediction frame template
-        # This is used by the Gym if ue_track_generator is None
-        # The Gym's BayesianDigitalTwin.create_prediction_frames will add cell-specific features
-        num_pts_side = int(math.sqrt(NUM_DUMMY_UE_POINTS_PER_CELL_FOR_GYM))
-        lons = np.linspace(site_config_df[c.CELL_LON].min(), site_config_df[c.CELL_LON].max(), num_pts_side)
-        lats = np.linspace(site_config_df[c.CELL_LAT].min(), site_config_df[c.CELL_LAT].max(), num_pts_side)
+            logger.error(f"Failed to init UETracksGenerator: {e}. Falling back to static template.")
+            use_generator_for_this_run = False # Modify the local variable if generator fails
+    
+    if not use_generator_for_this_run: # Check the (potentially modified) local variable
+        logger.info("Using static prediction_frame_template for Gym (grid of points).")
+        num_pts_side = int(math.sqrt(NUM_DUMMY_UE_POINTS_PER_CELL_FOR_GYM)) # Corrected variable name
+        if num_pts_side == 0 : num_pts_side = 1
+        lons = np.linspace(topology_df[c.CELL_LON].min(), topology_df[c.CELL_LON].max(), num_pts_side)
+        lats = np.linspace(topology_df[c.CELL_LAT].min(), topology_df[c.CELL_LAT].max(), num_pts_side)
         lon_grid, lat_grid = np.meshgrid(lons, lats)
         base_ue_locs = pd.DataFrame({
             getattr(c, 'LOC_X', 'loc_x'): lon_grid.ravel(),
             getattr(c, 'LOC_Y', 'loc_y'): lat_grid.ravel()
         })
-        for cell_id_val in site_config_df[c.CELL_ID].unique():
+        for cell_id_val in site_config_df_gym[getattr(c,'CELL_ID','cell_id')].unique():
             prediction_frame_template_gym[cell_id_val] = base_ue_locs.copy()
+    # *** FIX FOR UnboundLocalError ENDS HERE ***
 
-    # Example static traffic model (if needed by Gym reward and not None)
-    # This should ideally come from your traffic data analysis or a more complex model
     traffic_model_df_gym = None
-    # if os.path.exists(STATIC_TRAFFIC_MODEL_PATH):
-    #     traffic_model_df_gym = pd.read_csv(STATIC_TRAFFIC_MODEL_PATH)
-    #     logger.info("Loaded static traffic model for Gym.")
 
     # --- 5. Instantiate EnergySavingsGym ---
     logger.info("Instantiating EnergySavingsGym...")
     try:
         env = EnergySavingsGym(
-            bayesian_digital_twins=gym_bdt_dict, # Pass the dictionary of wrappers
-            site_config_df=site_config_df,
-            prediction_frame_template=prediction_frame_template_gym, # Used if ue_track_generator is None
+            bayesian_digital_twins=gym_bdt_predictors, # Pass the loaded map of BDT objects
+            site_config_df=site_config_df_gym,
+            prediction_frame_template=prediction_frame_template_gym,
             tilt_set=TILT_SET,
-            weak_coverage_threshold=WEAK_COVERAGE_THRESHOLD,
-            over_coverage_threshold=OVER_COVERAGE_THRESHOLD,
-            lambda_=LAMBDA_WEIGHT,
-            traffic_model_df=traffic_model_df_gym, # Pass None or loaded DataFrame
-            ue_track_generator=ue_track_generator_gym if USE_UE_TRACK_GENERATOR else None,
-            horizon=GYM_HORIZON,
-            debug=True # Set to False for less verbose output from Gym
+            weak_coverage_threshold=WEAK_COVERAGE_THRESHOLD_GYM,
+            over_coverage_threshold=OVER_COVERAGE_THRESHOLD_GYM,
+            lambda_=LAMBDA_WEIGHT_GYM,
+            traffic_model_df=traffic_model_df_gym,
+            ue_track_generator=ue_track_generator_gym if use_generator_for_this_run else None, # Use local var
+            horizon=GYM_HORIZON, debug=True
         )
         logger.info("EnergySavingsGym instantiated successfully.")
-    except Exception as e:
-        logger.exception(f"Error instantiating EnergySavingsGym: {e}")
-        return
+    except Exception as e: logger.exception(f"Error instantiating EnergySavingsGym: {e}"); return
 
-    # --- 6. Demo Interaction with the Gym ---
-    logger.info("--- Running Demo Interaction with Gym ---")
+    # --- 6. Demo Interaction ---
+    # ... (Demo loop as before) ...
+    logger.info("--- Running Demo Interaction with Gym (Random Actions) ---")
     try:
-        observation = env.reset() # Get initial observation
-        logger.info(f"Initial Observation: {observation}")
+        observation = env.reset()
+        logger.info(f"Initial Gym Observation: {observation}")
         total_reward_accumulated = 0
-        for step in range(GYM_HORIZON + 5): # Run for a bit longer than horizon
-            action = env.action_space.sample() # Take a random action
-            logger.info(f"\nStep {step + 1}/{GYM_HORIZON}")
-            logger.info(f"Taking Action: {action}")
-
-            observation, reward, done, info = env.step(action) # Get new state and reward
-
-            logger.info(f"Observation: {observation}")
-            logger.info(f"Reward: {reward:.4f}")
-            logger.info(f"Info: {info}") # Contains debug info from Gym step
+        for step_num in range(GYM_HORIZON): # Run for one episode
+            action = env.action_space.sample()
+            logger.info(f"\nGym Step {step_num + 1}/{GYM_HORIZON} - Action: {action}")
+            observation, reward, done, info = env.step(action)
+            logger.info(f"Gym Obs: {observation}, Reward: {reward:.3f}, Done: {done}, Info: {info}")
             total_reward_accumulated += reward
-
-            if done:
-                logger.info(f"Episode finished after {step + 1} steps.")
-                break
+            if done: logger.info(f"Episode finished at step {step_num + 1}."); break
         logger.info(f"Demo finished. Total accumulated reward: {total_reward_accumulated:.4f}")
-
-    except Exception as e:
-        logger.exception(f"Error during Gym interaction demo: {e}")
-    finally:
-        env.close()
-
+    except Exception as e: logger.exception(f"Error during Gym interaction: {e}")
+    finally: env.close()
 
 if __name__ == "__main__":
-    # Ensure data directory exists for dummy files if script needs to create them
     os.makedirs(DATA_DIR, exist_ok=True)
-    # TODO: Add logic to create dummy topology.csv, realistic_ue_training_data_30cell.csv,
-    # config.csv, and potentially a dummy model.pk if they don't exist, for this demo script to run.
-    # For now, assuming these files are manually prepared or generated by traffic_3.py first.
-
-    if not os.path.exists(TOPOLOGY_FILE_PATH):
-        logger.error(f"Missing topology file: {TOPOLOGY_FILE_PATH}. Please create it.")
-        sys.exit(1)
-    if not os.path.exists(TRAINING_DATA_CSV_PATH):
-        logger.error(f"Missing REALISTIC UE training data file: {TRAINING_DATA_CSV_PATH}. Please create it.")
-        sys.exit(1)
-
+    if not os.path.exists(TOPOLOGY_FILE_PATH): logger.error(f"Missing: {TOPOLOGY_FILE_PATH}"); sys.exit(1)
+    # TRAINING_DATA_CSV_PATH only needed if BDT training is active in main()
+    # if not os.path.exists(TRAINING_DATA_CSV_PATH): logger.error(f"Missing: {TRAINING_DATA_CSV_PATH}"); sys.exit(1)
+    if not os.path.exists(CONFIG_FILE_PATH): logger.error(f"Missing: {CONFIG_FILE_PATH}"); sys.exit(1)
     main()
