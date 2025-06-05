@@ -1,5 +1,6 @@
 # train_rl_cco.py
 # Script to train a Reinforcement Learning agent for CCO
+# MODIFIED to use a locally loaded BDT model for RF simulation
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -11,15 +12,12 @@ import logging
 import math
 from typing import Dict, List, Tuple, Optional, Any
 
-
-# --- Assume RADP imports & setup ---
-# Ensure RADP_ROOT is set correctly in environment or script
+# --- Path Setup ---
 RADP_ROOT = os.getenv("MAVERIC_ROOT", "/home/lk/Projects/accelcq-repos/cloudly/github/maveric") # MODIFY IF NEEDED
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 
 if not os.path.isdir(RADP_ROOT):
      potential_path = os.path.join(os.path.dirname(__file__), "..", "..")
@@ -32,15 +30,14 @@ try:
     from radp.client.helper import RADPHelper, SimulationStatus
     from radp.digital_twin.utils.cell_selection import perform_attachment
     from radp.digital_twin.utils import constants as c
-    # Assuming CcoEngine is in the CCO app directory relative to this script's potential location
-    sys.path.insert(0, os.path.join(RADP_ROOT, "apps")) # Add apps dir to path
+    from radp.digital_twin.rf.bayesian.bayesian_engine import BayesianDigitalTwin, ExactGPModel, NormMethod
+    sys.path.insert(0, os.path.join(RADP_ROOT, "apps"))
     from coverage_capacity_optimization.cco_engine import CcoEngine
-    logger.info("Successfully imported RADP and CCO modules.")
+    # logger.info("Successfully imported RADP and CCO modules.") # Moved to main
 except ImportError as e:
     print(f"FATAL: Error importing RADP/CCO modules: {e}. Check RADP_ROOT and ensure modules exist.")
     sys.exit(1)
 
-# --- RL Library Import (Example: Stable Baselines3) ---
 try:
     from stable_baselines3 import PPO
     from stable_baselines3.common.env_checker import check_env
@@ -50,173 +47,289 @@ except ImportError:
     print("FATAL: stable-baselines3 not found. Please install it: pip install stable-baselines3")
     sys.exit(1)
 
+# --- Global Configuration for Training Script ---
+DATA_DIR_TRAINER = "./"
+TOPOLOGY_FILE_TRAINER = os.path.join(DATA_DIR_TRAINER, "data", "topology.csv")
+CONFIG_FILE_PATH_TRAINER = os.path.join(DATA_DIR_TRAINER, "data", "config.csv")
+UE_DATA_DIR_TRAINER = os.path.join(DATA_DIR_TRAINER, "data", "ue_data_gym_ready")
+BDT_MODEL_FILE_PATH_TRAINER = os.path.join(DATA_DIR_TRAINER, "model.pickle")
+
+REWARD_WEIGHTS_TRAINER = {'coverage': 1.0, 'load': 5.0, 'qos': 10.0}
+TOTAL_TRAINING_TIMESTEPS_TRAINER = 2000
+PPO_POLICY_TRAINER = "MlpPolicy"
+LOG_DIR_TRAINER = "./rl_logs/"
+MODEL_SAVE_PATH_TRAINER = "./cco_rl_agent_ppo_local_sim"
+CHECKPOINT_FREQ_TRAINER = 100
+POSSIBLE_TILTS_TRAINER = list(np.arange(0.0, 21.0, 1.0))
+QOS_SINR_THRESHOLD_TRAINER = 0.0
+MAX_BAD_QOS_RATIO_TRAINER = 0.10
+WEAK_COVERAGE_THRESHOLD_REWARD_TRAINER = -95.0
+OVER_COVERAGE_THRESHOLD_REWARD_TRAINER = -65.0
+GYM_HORIZON_TRAINER = 24
+
+# Defaults for missing topology columns
+DEFAULT_HTX = 25.0
+DEFAULT_HRX = 1.5
+DEFAULT_CELL_AZ_DEG = 0.0
+DEFAULT_CELL_CARRIER_FREQ_MHZ = 2100.0
+
+
+# --- Topology Generation Function ---
+def generate_dummy_topology(
+    num_sites: int,
+    cells_per_site: int = 3,
+    lat_range: Tuple[float, float] = (40.7, 40.8),
+    lon_range: Tuple[float, float] = (-74.05, -73.95),
+    start_ecgi: int = 1001,
+    start_enodeb_id: int = 1,
+    default_tac: int = 1,
+    default_freq: int = DEFAULT_CELL_CARRIER_FREQ_MHZ, # Use global default
+    default_power_dbm: float = 25.0,
+    azimuth_step: int = 120,
+    default_htx: float = DEFAULT_HTX, # Use global default
+    default_hrx: float = DEFAULT_HRX  # Use global default
+) -> pd.DataFrame:
+    logger.info(f"Generating dummy topology for {num_sites} sites with {cells_per_site} cells each.")
+    topology_data = []
+    current_ecgi = start_ecgi
+    current_enodeb_id = start_enodeb_id
+
+    COL_CELL_ID = getattr(c, 'CELL_ID', 'cell_id')
+    COL_CELL_LAT = getattr(c, 'CELL_LAT', 'cell_lat')
+    COL_CELL_LON = getattr(c, 'CELL_LON', 'cell_lon')
+    COL_CELL_AZ_DEG = getattr(c, 'CELL_AZ_DEG', 'cell_az_deg')
+    COL_CELL_TXPWR_DBM = getattr(c, 'CELL_TXPWR_DBM', 'cell_txpwr_dbm')
+    COL_ECGI = getattr(c, 'ECGI', 'ecgi')
+    COL_SITE_ID = getattr(c, 'SITE_ID', 'site_id')
+    COL_CELL_NAME = getattr(c, 'CELL_NAME', 'cell_name')
+    COL_ENODEB_ID = getattr(c, 'ENODEB_ID', 'enodeb_id')
+    COL_TAC = getattr(c, 'TAC', 'tac')
+    COL_CELL_CARRIER_FREQ_MHZ = getattr(c, 'CELL_CARRIER_FREQ_MHZ', 'cell_carrier_freq_mhz')
+    COL_HTX = getattr(c, 'HTX', 'hTx') # Get constant name
+    COL_HRX = getattr(c, 'HRX', 'hRx') # Get constant name
+
+
+    for i in range(num_sites):
+        site_lat = np.random.uniform(lat_range[0], lat_range[1])
+        site_lon = np.random.uniform(lon_range[0], lon_range[1])
+        site_id_str = f"Site{i+1}"
+
+        for j in range(cells_per_site):
+            cell_az = (j * azimuth_step) % 360
+            cell_id_str = f"cell_{current_enodeb_id}_{cell_az}"
+            cell_name_str = f"Cell{j+1}"
+
+            row = {
+                COL_ECGI: current_ecgi,
+                COL_SITE_ID: site_id_str,
+                COL_CELL_NAME: cell_name_str,
+                COL_ENODEB_ID: current_enodeb_id,
+                COL_CELL_AZ_DEG: cell_az,
+                COL_TAC: default_tac,
+                COL_CELL_LAT: site_lat,
+                COL_CELL_LON: site_lon,
+                COL_CELL_ID: cell_id_str,
+                COL_CELL_CARRIER_FREQ_MHZ: default_freq,
+                COL_CELL_TXPWR_DBM: default_power_dbm + np.random.uniform(-2, 2),
+                COL_HTX: default_htx, # Add hTx
+                COL_HRX: default_hrx   # Add hRx
+            }
+            topology_data.append(row)
+        current_ecgi += 1
+        current_enodeb_id += 1
+
+    df = pd.DataFrame(topology_data)
+    column_order = [
+        COL_ECGI, COL_SITE_ID, COL_CELL_NAME, COL_ENODEB_ID, COL_CELL_AZ_DEG, COL_TAC,
+        COL_CELL_LAT, COL_CELL_LON, COL_CELL_ID, COL_CELL_CARRIER_FREQ_MHZ,
+        COL_CELL_TXPWR_DBM, COL_HTX, COL_HRX # Add to column order
+    ]
+    df = df.reindex(columns=column_order)
+    logger.info(f"Generated dummy topology DataFrame with {len(df)} cells.")
+    return df
+
 
 # === Custom Gym Environment Definition ===
-# (Ideally, this class should be in its own file, e.g., cco_rl_env.py and imported)
 class CCO_RL_Env(gym.Env):
-    """ Custom Gym Environment for Reinforcement Learning based CCO. """
+    # ... (CCO_RL_Env class definition as in your provided script A) ...
+    # (Make sure the imports like `perform_attachment` are within this class or globally available to it)
     metadata = {'render_modes': [], 'render_fps': 4}
 
     def __init__(self, topology_df: pd.DataFrame, ue_data_dir: str,
-                 bayesian_digital_twin_id: str, reward_weights: Dict[str, float],
-                 radp_client: RADPClient, radp_helper: RADPHelper,
+                 bdt_model_file_path: str, # Path to the pickled BDT model map
+                 reward_weights: Dict[str, float],
                  possible_tilts: List[float] = list(np.arange(0.0, 21.0, 1.0)),
-                 qos_sinr_threshold: float = 0.0, # dB
-                 max_bad_qos_ratio: float = 0.05 # Penalize above 5%
+                 qos_sinr_threshold: float = 0.0,
+                 max_bad_qos_ratio: float = 0.05,
+                 weak_coverage_threshold_reward: float = -95.0,
+                 over_coverage_threshold_reward: float = -65.0,
+                 horizon: int = 24
                 ):
         super().__init__()
-        # --- Essential Column Constants ---
         self.COL_CELL_ID = getattr(c, 'CELL_ID', 'cell_id')
         self.COL_CELL_EL_DEG = getattr(c, 'CELL_EL_DEG', 'cell_el_deg')
         self.COL_LAT = getattr(c, 'LAT', 'lat')
         self.COL_LON = getattr(c, 'LON', 'lon')
+        self.COL_RSRP_DBM = getattr(c, 'RSRP_DBM', 'rsrp_dbm')
+        self.COL_SINR_DB = getattr(c, 'SINR_DB', 'sinr_db')
+        self.COL_LOC_X = getattr(c, 'LOC_X', 'loc_x')
+        self.COL_LOC_Y = getattr(c, 'LOC_Y', 'loc_y')
 
-        self.topology_df = topology_df.copy()
+
+        self.topology_df = topology_df.copy() # This topology_df MUST have hTx, hRx etc.
         self.cell_ids = self.topology_df[self.COL_CELL_ID].unique().tolist()
         self.num_cells = len(self.cell_ids)
         self.ue_data_dir = ue_data_dir
-        self.bayesian_digital_twin_id = bayesian_digital_twin_id
-        self.radp_client = radp_client
-        self.radp_helper = radp_helper
+        
+        logger.info(f"Loading BDT model map from: {bdt_model_file_path}")
+        if not os.path.exists(bdt_model_file_path):
+            raise FileNotFoundError(f"BDT Model file not found at: {bdt_model_file_path}")
+        self.bdt_predictors: Dict[str, BayesianDigitalTwin] = BayesianDigitalTwin.load_model_map_from_pickle(bdt_model_file_path)
+        if not self.bdt_predictors or not isinstance(self.bdt_predictors, dict):
+            raise ValueError("Failed to load a valid BDT model map (dictionary of BayesianDigitalTwin objects).")
+        logger.info(f"Loaded {len(self.bdt_predictors)} BDT cell models.")
+        missing_bdt_cells = [cid for cid in self.cell_ids if cid not in self.bdt_predictors]
+        if missing_bdt_cells:
+            raise ValueError(f"Missing BDT models for cells in topology: {missing_bdt_cells}")
+
         self.reward_weights = reward_weights
         self.possible_tilts = possible_tilts
         self.num_tilt_options = len(possible_tilts)
         self.qos_sinr_threshold = qos_sinr_threshold
         self.max_bad_qos_ratio = max_bad_qos_ratio
+        self.weak_coverage_threshold_reward = weak_coverage_threshold_reward
+        self.over_coverage_threshold_reward = over_coverage_threshold_reward
+        self.horizon = horizon
 
-        # --- Define Action and Observation Spaces ---
         self.action_space = spaces.MultiDiscrete([self.num_tilt_options] * self.num_cells)
-        self.observation_space = spaces.Discrete(24) # Hour 0-23
+        self.observation_space = spaces.Discrete(24)
 
         self.ue_data_per_tick: Dict[int, Optional[pd.DataFrame]] = self._load_all_ue_data()
-        at_least_one_df_loaded = any(df is not None for df in self.ue_data_per_tick.values())
-
-        if not at_least_one_df_loaded: # If the flag is False (meaning all values were None or dict empty)
-            raise FileNotFoundError(f"No valid UE data files were successfully loaded from {self.ue_data_dir}")
+        at_least_one_df_loaded = any(df is not None and not df.empty for df in self.ue_data_per_tick.values())
+        if not at_least_one_df_loaded:
+            raise FileNotFoundError(f"No valid UE data files successfully loaded from {self.ue_data_dir}")
 
         self.current_tick = 0
-        self._current_config_id_counter = 0
         logger.info(f"CCO RL Env initialized. Num Cells: {self.num_cells}")
 
     def _load_all_ue_data(self) -> Dict[int, Optional[pd.DataFrame]]:
         data = {}
         logger.info(f"Loading per-tick UE data from {self.ue_data_dir}...")
         found_count = 0
-        for tick in range(24):
-            filename = f"generated_ue_data_for_cco_{tick}.csv"
+        for tick_val in range(24): 
+            filename = f"generated_ue_data_for_cco_{tick_val}.csv" 
             filepath = os.path.join(self.ue_data_dir, filename)
             if os.path.exists(filepath):
                 try:
                     df = pd.read_csv(filepath)
-                    if self.COL_LAT in df.columns and self.COL_LON in df.columns:
-                         # Keep only necessary columns + mock_ue_id for potential debugging
-                         data[tick] = df[[self.COL_LAT, self.COL_LON, 'mock_ue_id']].copy()
+                    input_lon_col = 'lon' if 'lon' in df.columns else getattr(c, 'LOC_X', 'loc_x')
+                    input_lat_col = 'lat' if 'lat' in df.columns else getattr(c, 'LOC_Y', 'loc_y')
+                    if input_lon_col not in df.columns and self.COL_LON in df.columns: input_lon_col = self.COL_LON
+                    if input_lat_col not in df.columns and self.COL_LAT in df.columns: input_lat_col = self.COL_LAT
+                    if input_lon_col in df.columns and input_lat_col in df.columns:
+                         df_gym = df[[input_lon_col, input_lat_col, 'mock_ue_id']].copy()
+                         df_gym.rename(columns={input_lon_col: 'loc_x', input_lat_col: 'loc_y'}, inplace=True)
+                         if 'lon' not in df_gym.columns and self.COL_LON in df.columns : df_gym['lon'] = df[self.COL_LON]
+                         if 'lat' not in df_gym.columns and self.COL_LAT in df.columns : df_gym['lat'] = df[self.COL_LAT]
+                         data[tick_val] = df_gym
                          found_count += 1
-                    else: logger.warning(f"Skipping {filename}: Missing lat/lon columns.")
-                except Exception as e:
-                    logger.error(f"Error loading {filepath}: {e}")
-                    data[tick] = None # Mark as unloadable
-            else: logger.warning(f"UE data file not found for tick {tick}: {filepath}"); data[tick] = None
+                    else: logger.warning(f"Skipping {filename}: Missing location columns.")
+                except Exception as e: logger.error(f"Error loading {filepath}: {e}"); data[tick_val] = None
+            else: logger.warning(f"UE data file not found for tick {tick_val}: {filepath}"); data[tick_val] = None
         logger.info(f"Loaded UE data for {found_count}/24 ticks.")
         return data
-
-    def _get_next_config_id(self) -> int:
-        self._current_config_id_counter += 1; return self._current_config_id_counter
 
     def _map_action_to_config(self, action: np.ndarray) -> pd.DataFrame:
         if len(action) != self.num_cells: raise ValueError("Action length mismatch")
         config_data = []
         for i, cell_id in enumerate(self.cell_ids):
-            tilt_index = np.clip(action[i], 0, self.num_tilt_options - 1) # Ensure valid index
+            tilt_index = np.clip(action[i], 0, self.num_tilt_options - 1)
             tilt_value = self.possible_tilts[tilt_index]
             config_data.append({self.COL_CELL_ID: cell_id, self.COL_CELL_EL_DEG: tilt_value})
         return pd.DataFrame(config_data)
 
-    def _run_backend_simulation(self, config_df: pd.DataFrame, ue_data_df: pd.DataFrame) -> Optional[pd.DataFrame]:
-        """Runs simulation, performs attachment, returns attached RF df or None."""
-        if ue_data_df is None or ue_data_df.empty: logger.error("Sim input UE data empty."); return None
-        config_id = self._get_next_config_id()
-        sim_event: Dict[str, Any] = {
-            "simulation_time_interval_seconds": 1,
-            "ue_tracks": {"ue_data_id": f"rl_eval_{self.current_tick}_{config_id}"},
-            "rf_prediction": {"model_id": self.bayesian_digital_twin_id, "config_id": config_id},
-        }
-        logger.debug(f"Running sim: Tick {self.current_tick}, ConfigID {config_id}")
+    def _run_local_simulation_with_bdt(self, config_df: pd.DataFrame, ue_data_df_template: pd.DataFrame) -> Optional[pd.DataFrame]:
+        if ue_data_df_template is None or ue_data_df_template.empty:
+            logger.error("Local sim: Input UE data template is empty.")
+            return None
+        all_cell_predictions = []
+        logger.debug(f"Local sim for tick {self.current_tick}: Processing {self.num_cells} cells.")
+        for i, cell_id in enumerate(self.cell_ids):
+            bdt_predictor = self.bdt_predictors.get(cell_id)
+            if not bdt_predictor:
+                logger.error(f"Local sim: BDT predictor for cell {cell_id} not found. Skipping."); continue
+            current_cell_config_series = config_df[config_df[self.COL_CELL_ID] == cell_id].iloc[0]
+            single_cell_site_config_for_bdt = self.topology_df[self.topology_df[self.COL_CELL_ID] == cell_id].copy()
+            if single_cell_site_config_for_bdt.empty:
+                 logger.error(f"Local sim: Topology data for cell {cell_id} not found. Skipping."); continue
+            single_cell_site_config_for_bdt[self.COL_CELL_EL_DEG] = current_cell_config_series[self.COL_CELL_EL_DEG]
+            try:
+                prediction_frames_dict = BayesianDigitalTwin.create_prediction_frames(
+                    site_config_df=single_cell_site_config_for_bdt,
+                    prediction_frame_template=ue_data_df_template
+                )
+            except Exception as e: logger.error(f"Local sim: Error in create_prediction_frames for cell {cell_id}: {e}"); continue
+            if cell_id not in prediction_frames_dict or prediction_frames_dict[cell_id].empty:
+                logger.warning(f"Local sim: create_prediction_frames no data for cell {cell_id}."); continue
+            df_to_predict_on = prediction_frames_dict[cell_id]
+            try:
+                bdt_predictor.predict_distributed_gpmodel(prediction_dfs=[df_to_predict_on])
+                all_cell_predictions.append(df_to_predict_on)
+            except Exception as e: logger.error(f"Local sim: BDT prediction error for cell {cell_id}: {e}")
+        if not all_cell_predictions: logger.warning("Local sim: No successful BDT predictions."); return None
+        combined_rf_predictions = pd.concat(all_cell_predictions, ignore_index=True)
+        if combined_rf_predictions.empty: logger.warning("Local sim: Combined RF predictions empty."); return None
         try:
-            sim_resp = self.radp_client.simulation(sim_event, ue_data_df, config_df)
-            sim_id = sim_resp.get("simulation_id"); assert sim_id
-            status = self.radp_helper.resolve_simulation_status(sim_id, wait_interval=1, max_attempts=120, verbose=False) # Increased attempts
-            if not status.success: raise Exception(f"Sim {sim_id} failed: {status.error_message}")
-            rf_full = self.radp_client.consume_simulation_output(sim_id)
-            if rf_full is None or rf_full.empty: logger.warning(f"Sim {sim_id} output empty."); return None
-            if 'rsrp_dbm' not in rf_full.columns or 'sinr_db' not in rf_full.columns: raise ValueError("Sim output missing RSRP/SINR.")
-            cell_selected_rf = perform_attachment(rf_full, self.topology_df)
-            logger.debug(f"Sim {sim_id} processed.")
-            return cell_selected_rf
-        except Exception as e: logger.exception(f"Backend sim error tick {self.current_tick}: {e}"); return None
+            cell_selected_rf = perform_attachment(combined_rf_predictions, self.topology_df)
+            logger.debug(f"Local sim tick {self.current_tick} attachment complete.")
+        except Exception as e: logger.exception(f"Local sim: Attachment error tick {self.current_tick}: {e}"); return None
+        if cell_selected_rf is None or cell_selected_rf.empty:
+            logger.warning(f"Local sim: Attachment tick {self.current_tick} empty result."); return None
+        if self.COL_RSRP_DBM not in cell_selected_rf.columns or self.COL_SINR_DB not in cell_selected_rf.columns:
+            logger.error(f"Local sim: Attached RF columns: {cell_selected_rf.columns.tolist()}")
+            raise ValueError("Attached RF missing RSRP/SINR after perform_attachment.")
+        return cell_selected_rf
+
+    def _calculate_load_balancing_objective(self, rf_dataframe: pd.DataFrame, topology_df_for_load: pd.DataFrame) -> float:
+        if rf_dataframe is None or rf_dataframe.empty or topology_df_for_load.empty: return 0.0
+        ue_counts = rf_dataframe.groupby(self.COL_CELL_ID).size()
+        all_cell_ids = topology_df_for_load[self.COL_CELL_ID].unique()
+        ue_counts_all = ue_counts.reindex(all_cell_ids, fill_value=0)
+        if len(ue_counts_all) <= 1: return 0.0
+        return -ue_counts_all.std()
 
     def _calculate_reward(self, cell_selected_rf: Optional[pd.DataFrame]) -> Tuple[float, Dict]:
-        """Calculates combined reward. Higher is better."""
-        info = {"coverage_score": 0.0, "load_score": -10.0, "qos_penalty": 10.0, "raw_neg_stdev": -10.0, "bad_qos_ratio": 1.0}
+        info = {"coverage_score": 0.0, "load_balance_score": -20.0, "qos_score": 0.0,
+                "raw_neg_stdev": -20.0, "bad_qos_ratio": 1.0}
         if cell_selected_rf is None or cell_selected_rf.empty:
-            logger.warning(f"Tick {self.current_tick}: Calculating reward based on empty RF data (sim failure?). Assigning high penalty.")
-            # Return large negative reward if simulation failed
-            return -100.0, info # Ensure penalty is significant
-
+            logger.warning(f"Tick {self.current_tick}: Reward calc: empty/failed RF data. High penalty.")
+            return -100.0, info
         try:
-            # 1. Coverage Score (Example: Mean positive utility, penalize negatives?)
-            # Assumes CcoEngine.rf_to_coverage_dataframe exists and works
-            # We might simplify this for RL - e.g., % UEs above RSRP threshold?
-            # Let's use % UEs NOT weakly covered for simplicity now.
-            cov_df = CcoEngine.rf_to_coverage_dataframe(cell_selected_rf, weak_coverage_threshold=-95) # Use only weak threshold
-            # Scale score from 0 to 100
-            coverage_score = (1.0 - cov_df['weakly_covered'].mean()) * 100.0
-            info["coverage_score"] = coverage_score
-
-            # 2. Load Balancing Score (-stdev, higher is better)
-            # Assumes CcoEngine.get_load_balancing_objective exists
-            load_score = CcoEngine.get_load_balancing_objective(cell_selected_rf, self.topology_df)
-            info["raw_neg_stdev"] = load_score # Store the raw -stdev
-            # Normalize or scale? Std dev depends on num UEs/cells. Let's scale it relative to max possible stdev?
-            # Simpler: just use the raw negative value, weighted. Max value is 0.
-            # Let's bound it slightly to avoid huge negative rewards if stdev is large
-            load_score_clipped = max(load_score, -50.0) # Cap penalty if stdev > 50
-            info["load_score"] = load_score_clipped
-
-            # 3. QoS Penalty (Penalize % UEs below SINR threshold)
-            sinr_ok = cell_selected_rf['sinr_db'] >= self.qos_sinr_threshold
-            bad_qos_ratio = 1.0 - sinr_ok.mean()
-            info["bad_qos_ratio"] = bad_qos_ratio
-            # Penalize linearly for exceeding the acceptable bad QoS ratio
-            qos_penalty = max(0, bad_qos_ratio - self.max_bad_qos_ratio)
-             # Scale penalty: e.g., if ratio is 10% over limit (0.15), penalty = 10*0.1 = 1
-            qos_penalty_scaled = qos_penalty * 100 # Make penalty larger relative to scores
-            info["qos_penalty"] = qos_penalty_scaled
-
-            # 4. Combine: Maximize Coverage, Maximize Load Score (-stdev), Minimize QoS Penalty
-            w_cov = self.reward_weights.get('coverage', 1.0)
-            w_load = self.reward_weights.get('load', 1.0) # Applied to load_score_clipped
-            w_qos = self.reward_weights.get('qos', 1.0) # Applied to qos_penalty_scaled
-
-            reward = (w_cov * coverage_score) + (w_load * load_score_clipped) - (w_qos * qos_penalty_scaled)
-
-            # Ensure reward is finite
-            if not np.isfinite(reward):
-                logger.warning(f"Non-finite reward calculated: {reward}. Components: {info}. Clipping.")
-                reward = -1000.0 # Assign large penalty
-
-        except Exception as e:
-            logger.exception(f"Error calculating reward for tick {self.current_tick}: {e}")
-            reward = -500.0 # Penalize calculation errors
-
+            cov_df = CcoEngine.rf_to_coverage_dataframe(
+                rf_dataframe=cell_selected_rf,
+                weak_coverage_threshold=self.weak_coverage_threshold_reward,
+                over_coverage_threshold=self.over_coverage_threshold_reward
+            )
+            info["coverage_score"] = (1.0 - cov_df['weakly_covered'].mean()) * 100.0
+            raw_neg_stdev = self._calculate_load_balancing_objective(cell_selected_rf, self.topology_df)
+            info["raw_neg_stdev"] = raw_neg_stdev; info["load_balance_score"] = max(raw_neg_stdev, -50.0)
+            if self.COL_SINR_DB in cell_selected_rf.columns and not cell_selected_rf[self.COL_SINR_DB].empty:
+                good_qos_ratio = (cell_selected_rf[self.COL_SINR_DB] >= self.qos_sinr_threshold).mean()
+                info["bad_qos_ratio"] = 1.0 - good_qos_ratio; info["qos_score"] = good_qos_ratio * 100.0
+            else: info["bad_qos_ratio"] = 1.0; info["qos_score"] = 0.0
+            reward = (self.reward_weights.get('coverage', 0) * info["coverage_score"] +
+                      self.reward_weights.get('load', 0) * info["load_balance_score"] +
+                      self.reward_weights.get('qos', 0) * info["qos_score"])
+            if not np.isfinite(reward): reward = -1000.0
+        except Exception as e: logger.exception(f"Reward calc error tick {self.current_tick}: {e}"); reward = -500.0
         info["reward_total"] = reward
-        logger.debug(f"Tick {self.current_tick}: Reward={reward:.3f}, Info={{{k: f'{v:.3f}' for k,v in info.items() if isinstance(v, (int, float))}}}")
+        info_log_str = ", ".join([f"{k_}: {v_:.3f}" if isinstance(v_, float) else f"{k_}: {v_}" for k_, v_ in info.items()])
+        logger.debug(f"Tick {self.current_tick}: Reward={reward:.3f}, Info={{{info_log_str}}}")
         return reward, info
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.current_tick = self.np_random.integers(0, 24) # Start at random hour? Or always 0? Let's use 0 for now.
-        # self.current_tick = 0
+        self.current_tick = self.np_random.integers(0, 24)
         observation = self.current_tick
         info = {}
         logger.debug(f"Env Reset. Start Tick: {self.current_tick}")
@@ -224,151 +337,95 @@ class CCO_RL_Env(gym.Env):
 
     def step(self, action: np.ndarray):
         current_eval_tick = self.current_tick
-        logger.debug(f"Step: Current Tick {current_eval_tick}, Action: {action}")
-
         config_df = self._map_action_to_config(action)
-        ue_data_df = self.ue_data_per_tick.get(current_eval_tick)
-
-        terminated = False # Episode runs over days/weeks during training
-        truncated = False # No artificial truncation for now
-
-        if ue_data_df is None:
-            logger.error(f"Missing UE data for tick {current_eval_tick}. Returning high penalty.")
-            reward = -1000.0
-            info = {"error": f"Missing UE data tick {current_eval_tick}"}
-            cell_selected_rf = None # Ensure info dict is populated below if needed
+        ue_data_df_for_tick = self.ue_data_per_tick.get(current_eval_tick)
+        terminated = False; truncated = False
+        if ue_data_df_for_tick is None or ue_data_df_for_tick.empty:
+            reward = -1000.0; info = {"error": f"Missing UE data tick {current_eval_tick}"}
         else:
-            cell_selected_rf = self._run_backend_simulation(config_df, ue_data_df)
-            reward, info = self._calculate_reward(cell_selected_rf)
-
-        # Add simulation results summary to info if needed for callbacks
-        info["tick"] = current_eval_tick
-        info["config"] = config_df[self.COL_CELL_EL_DEG].tolist() # Log applied tilts
-
-        # Transition state
+            cell_selected_rf_overall = self._run_local_simulation_with_bdt(config_df, ue_data_df_for_tick)
+            reward, info = self._calculate_reward(cell_selected_rf_overall)
+        info["tick"] = current_eval_tick; info["config"] = config_df[self.COL_CELL_EL_DEG].tolist()
         self.current_tick = (current_eval_tick + 1) % 24
         observation = self.current_tick
-
-        return observation, reward, terminated, truncated, info
+        # An episode is one full day (24 ticks)
+        done = (self.current_tick == 0 and current_eval_tick == 23) # Done after completing tick 23
+        return observation, reward, done, truncated, info
 
     def render(self): pass
     def close(self): logger.info("Closing CCO RL Env."); pass
 
 # === Main Training Script Logic ===
 if __name__ == "__main__":
-    logger.info("--- Starting CCO RL Agent Training Script ---")
+    logger.info("Successfully imported RADP and CCO modules.") # Moved here
+    logger.info("--- Starting CCO RL Agent Training Script (with Local BDT Simulation) ---")
+    os.makedirs(LOG_DIR_TRAINER, exist_ok=True)
+    if MODEL_SAVE_PATH_TRAINER and os.path.dirname(MODEL_SAVE_PATH_TRAINER) and not os.path.exists(os.path.dirname(MODEL_SAVE_PATH_TRAINER)):
+        os.makedirs(os.path.dirname(MODEL_SAVE_PATH_TRAINER))
 
-    # --- Configuration ---
-    TOPOLOGY_FILE = "./data/topology.csv" # Assumes topology exists
-    UE_DATA_DIR = "./ue_data"             # Directory with per-tick UE CSVs
-    # IMPORTANT: Get this ID after training the base RF model using cco_example_app or similar
-    BAYESIAN_DIGITAL_TWIN_MODEL_ID = "cco_test_model" # REPLACE with your actual trained model ID
-
-    # Reward Weights (NEEDS CAREFUL TUNING!)
-    REWARD_WEIGHTS = {
-        'coverage': 1.0, # Weight for (% Good Coverage * 100)
-        'load': 5.0,     # Weight for (max(-stdev(load), -50)) - higher weight means care more about balancing
-        'qos': 10.0      # Weight for penalty if bad_qos_ratio > 5%
-    }
-
-    # RL Training Hyperparameters
-    TOTAL_TRAINING_TIMESTEPS = 200000 # Adjust based on complexity/convergence (e.g., 1e5, 1e6)
-    PPO_POLICY = "MlpPolicy"          # Standard MLP policy for discrete obs, multidiscrete action
-    LOG_DIR = "./rl_logs/"            # Directory for TensorBoard logs
-    MODEL_SAVE_PATH = "./cco_rl_agent_ppo" # Path to save trained agent
-    CHECKPOINT_FREQ = 10000          # Save model checkpoint every N steps
-
-    os.makedirs(LOG_DIR, exist_ok=True)
-
-    # --- Initialization ---
     logger.info("Initializing components...")
     try:
-        topology = pd.read_csv(TOPOLOGY_FILE)
-        # Validate topology
+        topology = pd.read_csv(TOPOLOGY_FILE_TRAINER)
         if getattr(c, 'CELL_ID', 'cell_id') not in topology.columns: raise ValueError("Topology missing cell_id")
-        # Instantiate RADP Client and Helper (ensure .env or config is loaded for client)
-        radp_client = RADPClient()
-        radp_helper = RADPHelper(radp_client)
-        logger.info("RADP Client/Helper initialized.")
-    except FileNotFoundError:
-        logger.error(f"Topology file not found: {TOPOLOGY_FILE}"); sys.exit(1)
-    except Exception as e:
-        logger.error(f"Initialization error: {e}"); sys.exit(1)
+        
+        # Add missing columns to topology if they don't exist (hTx, hRx, cell_az_deg, cell_carrier_freq_mhz)
+        # These are needed by BayesianDigitalTwin.create_prediction_frames
+        cols_to_check_in_topo = {
+            getattr(c, 'HTX', 'hTx'): DEFAULT_HTX,
+            getattr(c, 'HRX', 'hRx'): DEFAULT_HRX,
+            getattr(c, 'CELL_AZ_DEG', 'cell_az_deg'): DEFAULT_CELL_AZ_DEG,
+            getattr(c, 'CELL_CARRIER_FREQ_MHZ', 'cell_carrier_freq_mhz'): DEFAULT_CELL_CARRIER_FREQ_MHZ
+        }
+        for col, default_val in cols_to_check_in_topo.items():
+            if col not in topology.columns:
+                logger.warning(f"Topology missing '{col}'. Adding default value: {default_val}")
+                topology[col] = default_val
+        
+        # RADPClient and RADPHelper are NOT used by the local BDT simulation environment
+        # radp_client = RADPClient()
+        # radp_helper = RADPHelper(radp_client)
+        # logger.info("RADP Client/Helper (if used by BDT internals) initialized.") # Not needed now
+    except FileNotFoundError: logger.error(f"Topology file not found: {TOPOLOGY_FILE_TRAINER}"); sys.exit(1)
+    except Exception as e: logger.error(f"Initialization error: {e}"); sys.exit(1)
 
-    # --- Create and Check Environment ---
     logger.info("Creating CCO RL Environment...")
     try:
         env = CCO_RL_Env(
             topology_df=topology,
-            ue_data_dir=UE_DATA_DIR,
-            bayesian_digital_twin_id=BAYESIAN_DIGITAL_TWIN_MODEL_ID,
-            reward_weights=REWARD_WEIGHTS,
-            radp_client=radp_client,
-            radp_helper=radp_helper
-            # Add optional params like possible_tilts if needed
+            ue_data_dir=UE_DATA_DIR_TRAINER,
+            bdt_model_file_path=BDT_MODEL_FILE_PATH_TRAINER,
+            reward_weights=REWARD_WEIGHTS_TRAINER,
+            # radp_client and radp_helper are removed as _run_local_simulation_with_bdt doesn't use them
+            possible_tilts=POSSIBLE_TILTS_TRAINER,
+            qos_sinr_threshold=QOS_SINR_THRESHOLD_TRAINER,
+            max_bad_qos_ratio=MAX_BAD_QOS_RATIO_TRAINER,
+            weak_coverage_threshold_reward=WEAK_COVERAGE_THRESHOLD_REWARD_TRAINER,
+            over_coverage_threshold_reward=OVER_COVERAGE_THRESHOLD_REWARD_TRAINER,
+            horizon=GYM_HORIZON_TRAINER
         )
-        # Wrap with Monitor for SB3 logging
-        env = Monitor(env, LOG_DIR)
-        # Check environment compatibility (optional but recommended)
-        # check_env(env)
+        env = Monitor(env, LOG_DIR_TRAINER)
         logger.info("Environment created successfully.")
-    except Exception as e:
-        logger.error(f"Failed to create RL environment: {e}"); sys.exit(1)
+    except FileNotFoundError as e:
+        logger.error(f"Failed to create RL environment: {e}. Ensure BDT model file exists at '{BDT_MODEL_FILE_PATH_TRAINER}'.")
+        sys.exit(1)
+    except Exception as e: logger.error(f"Failed to create RL environment: {e}"); sys.exit(1)
 
-    # --- Define Agent ---
-    # PPO is a good default choice supporting MultiDiscrete actions
-    # Hyperparameters might need tuning (learning_rate, n_steps, batch_size, etc.)
-    logger.info(f"Defining PPO agent with policy {PPO_POLICY}...")
-    model = PPO(
-        PPO_POLICY,
-        env,
-        verbose=1, # Log training progress
-        tensorboard_log=LOG_DIR,
-        # Example hyperparameter adjustments (defaults are often reasonable starting points)
-        # learning_rate=3e-4,
-        # n_steps=2048,
-        # batch_size=64,
-        # n_epochs=10,
-        # gamma=0.99,
-        # gae_lambda=0.95,
-        # clip_range=0.2,
-        # ent_coef=0.0,
-        # vf_coef=0.5,
-        # max_grad_norm=0.5,
-    )
-
-    # --- Define Callbacks ---
-    checkpoint_callback = CheckpointCallback(
-      save_freq=CHECKPOINT_FREQ,
-      save_path=LOG_DIR,
-      name_prefix="cco_rl_model",
-      save_replay_buffer=False, # Not applicable for PPO usually
-      save_vecnormalize=True # Save VecNormalize stats if used
-    )
-
-    # --- Train Agent ---
-    logger.info(f"Starting training for {TOTAL_TRAINING_TIMESTEPS} timesteps...")
+    logger.info(f"Defining PPO agent with policy {PPO_POLICY_TRAINER}...")
+    model = PPO(PPO_POLICY_TRAINER, env, verbose=1, tensorboard_log=LOG_DIR_TRAINER)
+    checkpoint_callback = CheckpointCallback(save_freq=CHECKPOINT_FREQ_TRAINER, save_path=LOG_DIR_TRAINER, name_prefix="cco_rl_model_local_sim")
+    
+    logger.info(f"Starting training for {TOTAL_TRAINING_TIMESTEPS_TRAINER} timesteps...")
     try:
-        model.learn(
-            total_timesteps=TOTAL_TRAINING_TIMESTEPS,
-            callback=checkpoint_callback,
-            log_interval=1, # Log stats every episode
-            tb_log_name="PPO_CCO_Run" # Name for TensorBoard run
-        )
+        model.learn(total_timesteps=TOTAL_TRAINING_TIMESTEPS_TRAINER, callback=checkpoint_callback, tb_log_name="PPO_CCO_LocalSim_Run")
         logger.info("Training finished.")
-    except Exception as e:
-        logger.exception(f"Error during training: {e}") # Log full traceback
-        # Decide whether to save partially trained model?
-        # model.save(f"{MODEL_SAVE_PATH}_interrupted")
-        # logger.info(f"Saved partially trained model to {MODEL_SAVE_PATH}_interrupted")
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user.")
+    except Exception as e: logger.exception(f"Error during training: {e}")
     finally:
-        # --- Save Final Model ---
         try:
-            model.save(MODEL_SAVE_PATH)
-            logger.info(f"Successfully saved trained model to {MODEL_SAVE_PATH}.zip")
-        except Exception as e:
-            logger.error(f"Failed to save final model: {e}")
-        # --- Close Environment ---
+            model.save(MODEL_SAVE_PATH_TRAINER)
+            logger.info(f"Successfully saved trained model to {MODEL_SAVE_PATH_TRAINER}.zip")
+        except Exception as e: logger.error(f"Failed to save final model: {e}")
         env.close()
-
     logger.info("--- Training Script Finished ---")
+

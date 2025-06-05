@@ -1,16 +1,17 @@
 # predict_cco_config.py
 # Loads a trained RL agent and predicts CCO config for a given hour.
 
-import gymnasium as gym
+import gymnasium as gym # Not strictly needed for this script, but good to keep if model expects gym types
 import numpy as np
 import pandas as pd
 import os
 import sys
 import argparse # For command-line arguments
 import logging
+from typing import List, Dict, Tuple, Optional, Any # <<< ADDED THIS IMPORT
 
 # --- Assume RADP constants import (only need CELL_ID) ---
-RADP_ROOT = os.getenv("MAVERIC_ROOT", "/path/to/your/maveric/project") # MODIFY IF NEEDED
+RADP_ROOT = os.getenv("MAVERIC_ROOT", "/home/lk/Projects/accelcq-repos/cloudly/github/maveric") # MODIFY IF NEEDED
 if not os.path.isdir(RADP_ROOT):
      potential_path = os.path.join(os.path.dirname(__file__), "..", "..")
      if os.path.isdir(os.path.join(potential_path, "radp")): RADP_ROOT = os.path.abspath(potential_path); print(f"Warning: RADP_ROOT assumed: {RADP_ROOT}")
@@ -53,10 +54,10 @@ def map_action_to_config_df(action: np.ndarray, cell_ids: List[str], possible_ti
 # --- Main Prediction Logic ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Predict CCO configuration for a given hour using a trained RL model.")
-    parser.add_argument("-m", "--model", type=str, default="./cco_rl_agent_ppo.zip", help="Path to the saved RL model zip file.")
+    parser.add_argument("-m", "--model", type=str, default="./cco_rl_agent_ppo_local_sim.zip", help="Path to the saved RL model zip file.")
     parser.add_argument("-t", "--topology", type=str, default="./data/topology.csv", help="Path to the topology CSV file (used for cell ID order).")
     parser.add_argument("--tick", type=int, required=True, help="The hour/tick (0-23) to predict the configuration for.")
-    parser.add_argument("--tilts", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20", help="Comma-separated list of possible tilt values (must match training).")
+    parser.add_argument("--tilts", type=str, default="0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0,13.0,14.0,15.0,16.0,17.0,18.0,19.0,20.0", help="Comma-separated list of possible tilt values (must match training).")
 
     args = parser.parse_args()
 
@@ -86,14 +87,23 @@ if __name__ == "__main__":
         logger.error(f"Error parsing possible tilts string '{args.tilts}': {e}"); sys.exit(1)
 
     # Load Model
+    model_load_path = args.model
+    if not model_load_path.endswith(".zip"): # SB3 usually saves with .zip
+        model_load_path += ".zip"
+
     try:
-        if not os.path.exists(args.model): raise FileNotFoundError("Model file not found.")
-        logger.info(f"Loading trained model from {args.model}...")
-        # Ensure you load the same algorithm type (PPO)
-        model = PPO.load(args.model)
+        if not os.path.exists(model_load_path):
+            # Try without .zip if the user provided it explicitly
+            if os.path.exists(args.model):
+                 model_load_path = args.model
+            else:
+                 raise FileNotFoundError(f"Model file not found at {model_load_path} or {args.model}")
+        
+        logger.info(f"Loading trained model from {model_load_path}...")
+        model = PPO.load(model_load_path)
         logger.info("Model loaded successfully.")
     except FileNotFoundError:
-        logger.error(f"Saved model file not found: {args.model}"); sys.exit(1)
+        logger.error(f"Saved model file not found: {model_load_path} (or {args.model})"); sys.exit(1)
     except Exception as e:
         logger.error(f"Error loading model: {e}"); sys.exit(1)
 
@@ -110,6 +120,8 @@ if __name__ == "__main__":
 
     # Map action to configuration DataFrame
     try:
+        # Ensure 'possible_tilts' for mapping matches what the env/agent used
+        # The 'args.tilts' provides this.
         predicted_config_df = map_action_to_config_df(action, cell_ids_ordered, possible_tilts)
     except Exception as e:
         logger.error(f"Error mapping action to config DataFrame: {e}"); sys.exit(1)
@@ -117,7 +129,6 @@ if __name__ == "__main__":
     # Output results
     print("\n--- Predicted Optimal Configuration ---")
     print(f"--- For Tick/Hour: {args.tick} ---")
-    # Print DataFrame in a readable format
     print(predicted_config_df.to_string(index=False))
 
     # Optionally save to CSV
