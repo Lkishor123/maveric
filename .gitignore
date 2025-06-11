@@ -74,3 +74,12 @@ notebooks/data/mro_data/
 # lock files
 *.lock
 venv
+apps/traffic_load/generated_data
+apps/energy_saving_demo/ue_data_per_tick/
+apps/energy_saving_demo/ue_data_gym_ready/
+apps/energy_saving_demo/rl_training_logs/
+apps/energy_saving_demo/rl_energy_saver_agent_ppo.zip
+
+apps/traffic/bck
+apps/traffic/data
+apps/traffic/rl_logs
