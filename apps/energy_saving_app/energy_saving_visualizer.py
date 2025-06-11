@@ -36,16 +36,6 @@ class EnergySavingVisualizer:
     """
 
     def __init__(self, bdt_model_path: str, rl_model_path: str, topology_path: str, config_path: str, ue_data_path_template: str):
-        """
-        Initializes the visualizer.
-
-        Args:
-            bdt_model_path (str): Path to the trained BDT model pickle file.
-            rl_model_path (str): Path to the trained RL agent zip file.
-            topology_path (str): Path to the topology CSV file.
-            config_path (str): Path to the config CSV file with cell tilts.
-            ue_data_path_template (str): Path template for UE data files, e.g., './ue_data_gym_ready/ue_{tick}.csv'.
-        """
         self.ue_data_path_template = ue_data_path_template
         
         topology_df = pd.read_csv(topology_path)
@@ -67,7 +57,6 @@ class EnergySavingVisualizer:
         self.rl_model = PPO.load(rl_model_path)
         logger.info("RL agent loaded.")
         
-        # FIX: Use the correct constants for the preprocessed data columns ('loc_x', 'loc_y')
         self.COL_LON = getattr(c, 'LOC_X', 'loc_x')
         self.COL_LAT = getattr(c, 'LOC_Y', 'loc_y')
         self.COL_CELL_LON = getattr(c, 'CELL_LON', 'cell_lon')
@@ -96,7 +85,8 @@ class EnergySavingVisualizer:
         
         return pd.concat(all_preds_list, ignore_index=True) if all_preds_list else pd.DataFrame()
 
-    def _plot_scenario(self, ax, title: str, ue_data: pd.DataFrame, serving_data: pd.DataFrame, active_towers: pd.DataFrame, inactive_towers: pd.DataFrame):
+    def _plot_scenario(self, ax, title: str, ue_data: pd.DataFrame, serving_data: pd.DataFrame, 
+                       active_towers: pd.DataFrame, inactive_towers: pd.DataFrame, partial_towers: pd.DataFrame):
         """A helper function to generate a single plot for a given scenario."""
         ax.set_title(title, fontsize=16)
         
@@ -110,12 +100,15 @@ class EnergySavingVisualizer:
                 ax.scatter(cell_ues[self.COL_LON], cell_ues[self.COL_LAT], color=cmap(i), s=10, alpha=0.8, label=f"UEs ({cell_id})")
 
         no_serve_ues = plot_df[plot_df['serving_cell_id'].isna()]
-        ax.scatter(no_serve_ues[self.COL_LON], no_serve_ues[self.COL_LAT], c='red', marker='x', s=25, label='Disconnected UEs')
+        ax.scatter(no_serve_ues[self.COL_LON], no_serve_ues[self.COL_LAT], c='darkorange', marker='x', s=25, label='Disconnected UEs')
 
-        # Plot active and inactive towers
-        ax.scatter(active_towers[self.COL_CELL_LON], active_towers[self.COL_CELL_LAT], marker='^', c='green', s=120, edgecolors='white', label='Active Towers')
+        # Updated plotting logic for towers with three states
+        if not active_towers.empty:
+            ax.scatter(active_towers[self.COL_CELL_LON], active_towers[self.COL_CELL_LAT], marker='^', c='green', s=150, edgecolors='black', label='Fully Active Sites')
         if not inactive_towers.empty:
-            ax.scatter(inactive_towers[self.COL_CELL_LON], inactive_towers[self.COL_CELL_LAT], marker='^', c='red', s=120, alpha=0.5, label='Inactive Towers')
+            ax.scatter(inactive_towers[self.COL_CELL_LON], inactive_towers[self.COL_CELL_LAT], marker='^', c='red', s=150, alpha=0.8, edgecolors='black', label='Fully Inactive Sites')
+        if not partial_towers.empty:
+            ax.scatter(partial_towers[self.COL_CELL_LON], partial_towers[self.COL_CELL_LAT], marker='^', c='yellow', s=150, edgecolors='black', label='Partially Active Sites')
 
         ax.set_xlabel("Longitude")
         ax.set_ylabel("Latitude")
@@ -136,25 +129,31 @@ class EnergySavingVisualizer:
         if self.COL_UE_ID not in ue_data_df.columns:
             ue_data_df[self.COL_UE_ID] = range(len(ue_data_df))
 
-        # --- Custom Attachment Logic ---
         def attach_ues(predictions_df: pd.DataFrame):
             if predictions_df.empty or self.COL_UE_ID not in predictions_df.columns:
                 return pd.DataFrame(columns=[self.COL_UE_ID, 'serving_cell_id'])
-            
-            # Find the best cell for each UE
             idx = predictions_df.groupby(self.COL_UE_ID)[self.COL_RXPOWER_DBM].idxmax()
             serving_data = predictions_df.loc[idx].copy()
-            # Select and rename columns to be clear
             serving_data.rename(columns={self.COL_CELL_ID: 'serving_cell_id'}, inplace=True)
             return serving_data[[self.COL_UE_ID, 'serving_cell_id']]
+            
+        # --- Site-level logic ---
+        # Create a site_id column, assuming format like 'cell_1_0' -> 'cell_1'
+        self.site_config_df['site_id'] = self.site_config_df[self.COL_CELL_ID].str.rsplit('_', n=1).str[0]
+        # Get unique physical tower locations based on site_id
+        site_locations = self.site_config_df.drop_duplicates(subset=['site_id']).copy()
 
-        # --- 1. Baseline Scenario (All Towers ON) ---
+        # --- 1. Baseline Scenario ---
         logger.info("Simulating baseline scenario (all towers on)...")
         all_cell_ids = self.site_config_df[self.COL_CELL_ID].tolist()
         baseline_preds = self._get_rf_predictions(ue_data_df, self.site_config_df, all_cell_ids)
         baseline_serving_data = attach_ues(baseline_preds)
+        # In baseline, all sites are fully active
+        baseline_active_towers = site_locations
+        baseline_inactive_towers = pd.DataFrame()
+        baseline_partial_towers = pd.DataFrame()
 
-        # --- 2. Optimized Scenario (RL Agent Decision) ---
+        # --- 2. Optimized Scenario ---
         logger.info("Simulating optimized scenario (energy saving)...")
         action_indices, _ = self.rl_model.predict(tick, deterministic=True)
         
@@ -165,18 +164,36 @@ class EnergySavingVisualizer:
                 inactive_cell_ids.append(cell_id)
             else:
                 active_cell_ids.append(cell_id)
+
+        # Determine the status of each site for the optimized plot
+        fully_active_sites, fully_inactive_sites, partially_active_sites = [], [], []
+        for site_id, group in self.site_config_df.groupby('site_id'):
+            all_cells_in_site = set(group[self.COL_CELL_ID])
+            active_cells_in_site = all_cells_in_site.intersection(active_cell_ids)
+            
+            if len(active_cells_in_site) == 0:
+                fully_inactive_sites.append(site_id)
+            elif len(active_cells_in_site) == len(all_cells_in_site):
+                fully_active_sites.append(site_id)
+            else:
+                partially_active_sites.append(site_id)
         
-        active_topology = self.site_config_df[self.site_config_df[self.COL_CELL_ID].isin(active_cell_ids)]
-        optimized_preds = self._get_rf_predictions(ue_data_df, active_topology, active_cell_ids)
+        opt_active_towers = site_locations[site_locations['site_id'].isin(fully_active_sites)]
+        opt_inactive_towers = site_locations[site_locations['site_id'].isin(fully_inactive_sites)]
+        opt_partial_towers = site_locations[site_locations['site_id'].isin(partially_active_sites)]
+        
+        active_topology_for_sim = self.site_config_df[self.site_config_df[self.COL_CELL_ID].isin(active_cell_ids)]
+        optimized_preds = self._get_rf_predictions(ue_data_df, active_topology_for_sim, active_cell_ids)
         optimized_serving_data = attach_ues(optimized_preds)
 
         # --- 3. Generate Plots ---
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(24, 10), sharex=True, sharey=True)
         fig.suptitle(f'Energy Saving Comparison for Tick {tick}', fontsize=20)
 
-        inactive_topology = self.site_config_df[self.site_config_df[self.COL_CELL_ID].isin(inactive_cell_ids)]
-        self._plot_scenario(ax1, 'Baseline: All Towers Active', ue_data_df, baseline_serving_data, self.site_config_df, pd.DataFrame())
-        self._plot_scenario(ax2, 'Optimized: Energy Saving Enabled', ue_data_df, optimized_serving_data, active_topology, inactive_topology)
+        self._plot_scenario(ax1, 'Baseline: All Towers Active', ue_data_df, baseline_serving_data,
+                            baseline_active_towers, baseline_inactive_towers, baseline_partial_towers)
+        self._plot_scenario(ax2, 'Optimized: Energy Saving Enabled', ue_data_df, optimized_serving_data,
+                            opt_active_towers, opt_inactive_towers, opt_partial_towers)
 
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"energy_saving_comparison_tick_{tick}.png")
