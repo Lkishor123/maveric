@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 class UEDataPreprocessor:
     """
-    Preprocesses raw UE data CSVs to be compatible with the RL Gym environment.
+    Preprocesses raw UE data CSVs to be compatible with the Gym environment.
     Renames longitude/latitude columns to loc_x/loc_y.
     """
     def __init__(self, base_data_dir: str):
@@ -35,7 +35,7 @@ class UEDataPreprocessor:
             ue_csv_files = glob.glob(input_file_pattern)
 
             if not ue_csv_files:
-                logger.warning(f"No UE data CSV files found in '{input_dir}' for Day_{day_num}. Skipping.")
+                logger.warning(f"No UE data CSV files found in '{input_dir}' for Day_{day_num}.")
                 continue
 
             logger.info(f"Processing {len(ue_csv_files)} files for Day_{day_num}...")
@@ -59,4 +59,4 @@ class UEDataPreprocessor:
                     processed_count += 1
                 except Exception as e:
                     logger.error(f"Error processing file {filepath}: {e}")
-            logger.info(f"Finished preprocessing for Day_{day_num}. Processed {processed_count}/{len(ue_csv_files)} files into '{output_dir}'.")
+            logger.info(f"Finished preprocessing for Day_{day_num}. Processed {processed_count} files into '{output_dir}'.")

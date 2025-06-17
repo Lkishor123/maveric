@@ -13,7 +13,7 @@ except ImportError:
     print("FATAL: Could not import RADP client modules. Ensure project root is in PYTHONPATH.")
     sys.exit(1)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class BDTManager:

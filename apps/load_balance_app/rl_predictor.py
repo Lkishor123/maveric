@@ -10,29 +10,41 @@ import numpy as np
 
 try:
     from stable_baselines3 import PPO
+    # Add path to import constants
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT = os.path.dirname(os.path.dirname(APP_DIR))
     sys.path.insert(0, PROJECT_ROOT)
     from radp.digital_twin.utils import constants as c
 except ImportError as e:
-    print(f"FATAL: Error importing libraries: {e}"); sys.exit(1)
+    print(f"FATAL: Error importing libraries: {e}. Ensure stable-baselines3 is installed and RADP_ROOT is correct."); sys.exit(1)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-TILT_SET = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0]
+TILT_SET_PREDICTOR = [float(t) for t in range(21)] # Must match training
+
+def map_action_to_config_df(action: np.ndarray, cell_ids: List[str], possible_tilts: List[float]) -> pd.DataFrame:
+    """Converts a numerical action from the RL agent to a readable config DataFrame."""
+    config_list = []
+    num_tilt_options = len(possible_tilts)
+    for i, cell_action_idx in enumerate(action):
+        cell_id = cell_ids[i]
+        tilt_index = np.clip(cell_action_idx, 0, num_tilt_options - 1)
+        tilt = possible_tilts[tilt_index]
+        config_list.append({"cell_id": cell_id, "predicted_cell_el_deg": tilt})
+    return pd.DataFrame(config_list)
 
 def run_rl_prediction(model_load_path: str, topology_path: str, target_tick: int):
     """
-    Loads a trained RL agent and predicts the optimal cell configuration (tilts and on/off state).
+    Loads a trained RL agent and predicts the optimal cell tilt configuration for a given tick.
     """
-    logger.info(f"--- Running RL Energy Saver Prediction for Tick {target_tick} ---")
+    logger.info(f"--- Running CCO RL Prediction for Tick {target_tick} ---")
     if not (0 <= target_tick <= 23):
         logger.error(f"Target tick {target_tick} is out of range (0-23)."); return
 
     try:
         topology_df = pd.read_csv(topology_path)
-        cell_ids_ordered = topology_df[getattr(c,'CELL_ID','cell_id')].unique().tolist()
+        cell_ids_ordered = topology_df[getattr(c, 'CELL_ID', 'cell_id')].unique().tolist()
         
         model_file = model_load_path if model_load_path.endswith(".zip") else f"{model_load_path}.zip"
         if not os.path.exists(model_file):
@@ -43,20 +55,9 @@ def run_rl_prediction(model_load_path: str, topology_path: str, target_tick: int
 
         action_indices, _ = rl_model.predict(target_tick, deterministic=True)
         
-        config_list = []
-        if len(action_indices) != len(cell_ids_ordered):
-            logger.error(f"Action length {len(action_indices)} != num cells {len(cell_ids_ordered)}"); return
-
-        for i, cell_action_idx in enumerate(action_indices):
-            cell_id = cell_ids_ordered[i]
-            if cell_action_idx == len(TILT_SET): # Special index for "OFF"
-                state, tilt = "OFF", "N/A"
-            else:
-                state, tilt = "ON", TILT_SET[cell_action_idx]
-            config_list.append({"cell_id": cell_id, "predicted_state": state, "predicted_cell_el_deg": tilt})
+        predicted_config_df = map_action_to_config_df(action_indices, cell_ids_ordered, TILT_SET_PREDICTOR)
         
-        predicted_config_df = pd.DataFrame(config_list)
-        print("\n--- Predicted Optimal Configuration ---")
+        print("\n--- Predicted Optimal Tilt Configuration ---")
         print(f"--- For Tick/Hour: {target_tick} ---")
         print(predicted_config_df.to_string(index=False))
 
