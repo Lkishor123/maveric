@@ -1,5 +1,3 @@
-# cco_visualizer.py
-
 import os
 import sys
 import logging
@@ -38,11 +36,10 @@ class CCOVisualizer:
         self.site_config_df_base['cell_el_deg'].fillna(TILT_SET_VISUALIZER[len(TILT_SET_VISUALIZER)//2], inplace=True)
         
         required_cols = {'hTx': 25.0, 'hRx': 1.5, 'cell_az_deg': 0.0, 'cell_carrier_freq_mhz': 2100.0}
-        for const, val in required_cols.items():
-            col = getattr(c, const, const.lower())
+        for col, val in required_cols.items():
             if col not in self.site_config_df_base.columns:
                 self.site_config_df_base[col] = val
-        
+
         logger.info("Loading BDT model map..."); self.bdt_model_map = BayesianDigitalTwin.load_model_map_from_pickle(bdt_model_path)
         logger.info(f"Loaded BDT map for {len(self.bdt_model_map)} cells.")
 
@@ -55,6 +52,8 @@ class CCOVisualizer:
         self.COL_CELL_LON = getattr(c, 'CELL_LON', 'cell_lon'); self.COL_CELL_LAT = getattr(c, 'CELL_LAT', 'cell_lat')
         self.COL_CELL_ID = getattr(c, 'CELL_ID', 'cell_id'); self.COL_UE_ID = 'ue_id'
         self.COL_RXPOWER_DBM = getattr(c, 'RXPOWER_DBM', 'rxpower_dbm')
+        self.COL_RSRP_DBM = getattr(c, 'RSRP_DBM', 'rsrp_dbm')
+
 
     def _run_local_simulation(self, ue_data: pd.DataFrame, site_config: pd.DataFrame) -> pd.DataFrame:
         """Runs a local RF simulation and performs cell attachment."""
@@ -78,20 +77,46 @@ class CCOVisualizer:
         """Helper to generate a single subplot."""
         ax.set_title(title, fontsize=16)
         
-        # Merge UE data with attached data to get serving cell for each UE
-        plot_df = pd.merge(ue_data, attached_data[[self.COL_UE_ID, self.COL_CELL_ID, self.COL_RSRP_DBM]], on=self.COL_UE_ID, how="left")
+        merge_keys = [self.COL_LON, self.COL_LAT]
+        plot_df = pd.merge(ue_data, attached_data, on=merge_keys, how="left")
         plot_df.rename(columns={self.COL_CELL_ID: 'serving_cell_id'}, inplace=True)
         
-        # Plot UEs colored by RSRP level
-        cmap = plt.get_cmap('viridis_r') # Reversed viridis: purple (strong) -> yellow (weak)
-        sc = ax.scatter(plot_df[self.COL_LON], plot_df[self.COL_LAT], c=plot_df[self.COL_RSRP_DBM], cmap=cmap, s=10, alpha=0.9, vmin=-120, vmax=-70)
-        plt.colorbar(sc, ax=ax, label='RSRP (dBm)')
+        # --- ENHANCEMENT: Plot UEs colored by serving cell ---
+        legend_handles = []
+        
+        # Get a list of all cells that are serving at least one UE
+        unique_serving_cells = sorted(plot_df["serving_cell_id"].dropna().unique())
+        
+        # Create a color map to assign a unique color to each serving cell
+        if unique_serving_cells:
+            cmap = plt.get_cmap("tab20", len(unique_serving_cells))
+            for i, cell_id in enumerate(unique_serving_cells):
+                cell_ues = plot_df[plot_df["serving_cell_id"] == cell_id]
+                color = cmap(i)
+                ax.scatter(cell_ues[self.COL_LON], cell_ues[self.COL_LAT], color=color, s=10, alpha=0.8)
+                legend_handles.append(Line2D([0], [0], marker='o', color='w', label=f'UEs ({cell_id})',
+                                             markerfacecolor=color, markersize=8))
+        
+        # Plot UEs that are not connected to any cell
+        unserved_ues = plot_df[plot_df['serving_cell_id'].isna()]
+        if not unserved_ues.empty:
+            ax.scatter(unserved_ues[self.COL_LON], unserved_ues[self.COL_LAT], c='gray', marker='x', s=15, label="Disconnected UEs")
+            legend_handles.append(Line2D([0], [0], marker='x', color='gray', linestyle='None', markersize=8, label='Disconnected UEs'))
 
-        # Plot towers
-        ax.scatter(self.site_config_df_base[self.COL_CELL_LON], self.site_config_df_base[self.COL_CELL_LAT], marker='^', c='red', s=80, edgecolors='black', label='Cell Towers')
+
+        # --- ENHANCEMENT: Plot and label all cell towers ---
+        ax.scatter(self.site_config_df_base[self.COL_CELL_LON], self.site_config_df_base[self.COL_CELL_LAT], 
+                   marker='^', c='red', s=120, edgecolors='black', label='Cell Towers')
+        legend_handles.append(Line2D([0], [0], marker='^', color='w', label='Cell Towers',
+                                     markerfacecolor='red', markeredgecolor='black', markersize=12))
+
+        # Add text labels next to each tower
+        for i, row in self.site_config_df_base.iterrows():
+            ax.text(row[self.COL_CELL_LON] + 0.001, row[self.COL_CELL_LAT], row[self.COL_CELL_ID], fontsize=9, ha='left')
 
         ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude"); ax.grid(True, linestyle='--', alpha=0.4)
-        ax.legend(loc='best', fontsize='small')
+        ax.legend(handles=legend_handles, loc='best', fontsize='small')
+
 
     def generate_comparison_plots(self, day: int, tick: int, output_dir: str):
         """Generates and saves a side-by-side comparison plot."""
@@ -101,7 +126,11 @@ class CCOVisualizer:
             logger.error(f"Test UE data file not found: {ue_data_file}"); return
         
         ue_data_df = pd.read_csv(ue_data_file)
-        ue_data_df[self.COL_UE_ID] = range(len(ue_data_df))
+        if 'mock_ue_id' in ue_data_df.columns:
+             ue_data_df.rename(columns={'mock_ue_id': self.COL_UE_ID}, inplace=True)
+        elif self.COL_UE_ID not in ue_data_df.columns:
+             ue_data_df[self.COL_UE_ID] = range(len(ue_data_df))
+
 
         # --- 1. Baseline Scenario Simulation ---
         logger.info("Simulating baseline scenario (initial tilts)...")
@@ -114,9 +143,12 @@ class CCOVisualizer:
         opt_config_df = self.site_config_df_base.copy()
         for i, cell_action_idx in enumerate(action_indices):
             cell_id = self.site_config_df_base[self.COL_CELL_ID].iloc[i]
-            # Assumes RL agent action is only tilt index
             opt_config_df.loc[opt_config_df[self.COL_CELL_ID] == cell_id, getattr(c,'CELL_EL_DEG','cell_el_deg')] = TILT_SET_VISUALIZER[cell_action_idx]
 
+        required_cols = {'hTx': 25.0, 'hRx': 1.5}
+        for col, val in required_cols.items():
+            if col not in opt_config_df.columns:
+                opt_config_df[col] = val
         optimized_attached_df = self._run_local_simulation(ue_data_df, opt_config_df)
 
         # --- 3. Generate Plots ---
@@ -131,4 +163,3 @@ class CCOVisualizer:
         plt.savefig(output_path, bbox_inches='tight')
         logger.info(f"Comparison plot saved to: {output_path}")
         plt.close(fig)
-

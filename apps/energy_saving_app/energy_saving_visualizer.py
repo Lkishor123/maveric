@@ -1,5 +1,3 @@
-# energy_saving_visualizer.py
-
 import os
 import sys
 import logging
@@ -38,8 +36,7 @@ class EnergySavingVisualizer:
         self.site_config_df_base['cell_el_deg'].fillna(TILT_SET[len(TILT_SET)//2], inplace=True)
         
         required_cols = {'hTx': 25.0, 'hRx': 1.5, 'cell_az_deg': 0.0, 'cell_carrier_freq_mhz': 2100.0}
-        for const, val in required_cols.items():
-            col = getattr(c, const, const.lower())
+        for col, val in required_cols.items():
             if col not in self.site_config_df_base.columns:
                 self.site_config_df_base[col] = val
         
@@ -52,7 +49,7 @@ class EnergySavingVisualizer:
         
         self.COL_LON = getattr(c, 'LOC_X', 'loc_x'); self.COL_LAT = getattr(c, 'LOC_Y', 'loc_y')
         self.COL_CELL_LON = getattr(c, 'CELL_LON', 'cell_lon'); self.COL_CELL_LAT = getattr(c, 'CELL_LAT', 'cell_lat')
-        self.COL_CELL_ID = getattr(c, 'CELL_ID', 'cell_id'); self.COL_UE_ID = 'ue_id'
+        self.COL_CELL_ID = getattr(c, 'CELL_ID', 'cell_id'); self.COL_UE_ID = 'mock_ue_id' # Aligned with generated data
         self.COL_RXPOWER_DBM = getattr(c, 'RXPOWER_DBM', 'rxpower_dbm'); self.COL_RSRP_DBM = getattr(c, 'RSRP_DBM', 'rsrp_dbm')
 
     def _run_local_simulation(self, ue_data: pd.DataFrame, site_config: pd.DataFrame) -> pd.DataFrame:
@@ -79,26 +76,34 @@ class EnergySavingVisualizer:
         """Helper to generate a single subplot."""
         ax.set_title(title, fontsize=16)
         
-        # Plot towers based on their activity status first
-        ax.scatter(active_towers[self.COL_CELL_LON], active_towers[self.COL_CELL_LAT], marker='^', c='green', s=150, edgecolors='black', label='Fully Active Sites', zorder=10)
-        ax.scatter(inactive_towers[self.COL_CELL_LON], inactive_towers[self.COL_CELL_LAT], marker='^', c='red', s=150, alpha=0.7, edgecolors='black', label='Fully Inactive Sites', zorder=10)
-        ax.scatter(partial_towers[self.COL_CELL_LON], partial_towers[self.COL_CELL_LAT], marker='^', c='yellow', s=150, edgecolors='black', label='Partially Active Sites', zorder=10)
-
-        # Plot UEs colored by RSRP level
-        if not attached_data.empty:
-            plot_df = pd.merge(ue_data, attached_data[[self.COL_UE_ID, self.COL_RSRP_DBM, self.COL_CELL_ID]], on=self.COL_UE_ID, how="left")
-            plot_df.rename(columns={self.COL_CELL_ID: 'serving_cell_id'}, inplace=True)
-            
-            served_ues = plot_df.dropna(subset=[self.COL_RSRP_DBM])
-            cmap = plt.get_cmap('viridis_r'); vmin, vmax = -120, -70
-            sc = ax.scatter(served_ues[self.COL_LON], served_ues[self.COL_LAT], c=served_ues[self.COL_RSRP_DBM], cmap=cmap, s=10, alpha=0.9, vmin=vmin, vmax=vmax, zorder=5)
-            plt.colorbar(sc, ax=ax, label='RSRP (dBm)', fraction=0.046, pad=0.04)
-
-            no_serve_ues = plot_df[plot_df['serving_cell_id'].isna()]
-            ax.scatter(no_serve_ues[self.COL_LON], no_serve_ues[self.COL_LAT], c='darkorange', marker='x', s=25, label='Disconnected UEs', zorder=6)
-        else: # Case where all cells might be off
-            ax.scatter(ue_data[self.COL_LON], ue_data[self.COL_LAT], c='darkorange', marker='x', s=25, label='Disconnected UEs', zorder=6)
+        merge_keys = [self.COL_LON, self.COL_LAT]
+        plot_df = pd.merge(ue_data, attached_data, on=merge_keys, how="left")
+        plot_df.rename(columns={self.COL_CELL_ID: 'serving_cell_id'}, inplace=True)
         
+        served_ues = plot_df.dropna(subset=['serving_cell_id'])
+        unique_cells = sorted(served_ues["serving_cell_id"].unique())
+        
+        if unique_cells:
+            cmap = plt.get_cmap('viridis', len(unique_cells))
+            for i, cell_id in enumerate(unique_cells):
+                cell_ues = served_ues[served_ues["serving_cell_id"] == cell_id]
+                ax.scatter(cell_ues[self.COL_LON], cell_ues[self.COL_LAT], color=cmap(i), s=10, alpha=0.8, label=f"UEs ({cell_id})")
+
+        no_serve_ues = plot_df[plot_df['serving_cell_id'].isna()]
+        ax.scatter(no_serve_ues[self.COL_LON], no_serve_ues[self.COL_LAT], c='darkorange', marker='x', s=25, label='Disconnected UEs')
+
+        # FIX: Add safety checks to only plot dataframes that are not empty
+        if not active_towers.empty:
+            ax.scatter(active_towers[self.COL_CELL_LON], active_towers[self.COL_CELL_LAT], marker='^', c='green', s=150, edgecolors='black', label='Fully Active Sites', zorder=10)
+        if not inactive_towers.empty:
+            ax.scatter(inactive_towers[self.COL_CELL_LON], inactive_towers[self.COL_CELL_LAT], marker='^', c='red', s=150, alpha=0.7, edgecolors='black', label='Fully Inactive Sites', zorder=10)
+        if not partial_towers.empty:
+            ax.scatter(partial_towers[self.COL_CELL_LON], partial_towers[self.COL_CELL_LAT], marker='^', c='yellow', s=150, edgecolors='black', label='Partially Active Sites', zorder=10)
+
+        # Add text labels next to each tower
+        for i, row in self.site_config_df_base.iterrows():
+            ax.text(row[self.COL_CELL_LON] + 0.001, row[self.COL_CELL_LAT], row[self.COL_CELL_ID], fontsize=9, ha='left')
+
         ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude"); ax.grid(True, linestyle='--', alpha=0.4); ax.legend(loc='best', fontsize='small')
 
     def generate_comparison_plots(self, day: int, tick: int, output_dir: str):
@@ -107,12 +112,20 @@ class EnergySavingVisualizer:
         if not os.path.exists(ue_data_file): logger.error(f"Test UE data file not found: {ue_data_file}"); return
         
         ue_data_df = pd.read_csv(ue_data_file)
-        ue_data_df[self.COL_UE_ID] = range(len(ue_data_df))
+        if self.COL_UE_ID not in ue_data_df.columns:
+            logger.error(f"UE data file is missing required column: '{self.COL_UE_ID}'")
+            return
 
-        # --- Site-level logic ---
+        def attach_ues(predictions_df: pd.DataFrame):
+            if predictions_df.empty or self.COL_UE_ID not in predictions_df.columns:
+                return pd.DataFrame()
+            idx = predictions_df.groupby(self.COL_UE_ID)[self.COL_RXPOWER_DBM].idxmax()
+            serving_data = predictions_df.loc[idx].copy()
+            return serving_data
+
         site_id_col = getattr(c, 'SITE_ID', 'site_id')
         if site_id_col not in self.site_config_df_base.columns:
-            self.site_config_df_base['site_id_temp'] = self.site_config_df_base[self.COL_CELL_ID].str.rsplit('_', n=2).str[1]
+            self.site_config_df_base['site_id_temp'] = self.site_config_df_base[self.COL_CELL_ID].str.rsplit('_', n=1).str[0]
             site_id_col = 'site_id_temp'
         site_locations = self.site_config_df_base.drop_duplicates(subset=[site_id_col]).copy()
 
@@ -125,23 +138,23 @@ class EnergySavingVisualizer:
         logger.info("Simulating RL-optimized scenario...")
         action_indices, _ = self.rl_model.predict(tick, deterministic=True)
         
-        opt_config_df = self.site_config_df_base.copy()
         active_cell_ids = []
         for i, cell_action_idx in enumerate(action_indices):
-            cell_id = self.site_config_df_base[self.COL_CELL_ID].iloc[i]
             if cell_action_idx < len(TILT_SET):
-                active_cell_ids.append(cell_id)
-                opt_config_df.loc[opt_config_df[self.COL_CELL_ID] == cell_id, getattr(c,'CELL_EL_DEG','cell_el_deg')] = TILT_SET[cell_action_idx]
-
-        active_topology_for_sim = opt_config_df[opt_config_df[self.COL_CELL_ID].isin(active_cell_ids)]
+                active_cell_ids.append(self.site_config_df_base[self.COL_CELL_ID].iloc[i])
+        
+        active_topology_for_sim = self.site_config_df_base[self.site_config_df_base[self.COL_CELL_ID].isin(active_cell_ids)]
         optimized_attached_df = self._run_local_simulation(ue_data_df, active_topology_for_sim)
         
         fully_active_sites, fully_inactive_sites, partially_active_sites = [], [], []
         for site_id, group in self.site_config_df_base.groupby(site_id_col):
             active_cells_in_site = set(group[self.COL_CELL_ID]).intersection(active_cell_ids)
-            if len(active_cells_in_site) == 0: fully_inactive_sites.append(site_id)
-            elif len(active_cells_in_site) == len(group): fully_active_sites.append(site_id)
-            else: partially_active_sites.append(site_id)
+            if not active_cells_in_site:
+                fully_inactive_sites.append(site_id)
+            elif len(active_cells_in_site) == len(group):
+                fully_active_sites.append(site_id)
+            else:
+                partially_active_sites.append(site_id)
         
         opt_active_towers = site_locations[site_locations[site_id_col].isin(fully_active_sites)]
         opt_inactive_towers = site_locations[site_locations[site_id_col].isin(fully_inactive_sites)]
@@ -161,4 +174,3 @@ class EnergySavingVisualizer:
         plt.savefig(output_path, bbox_inches='tight')
         logger.info(f"Comparison plot saved to: {output_path}")
         plt.close(fig)
-
